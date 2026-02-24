@@ -21,7 +21,7 @@ watchlist:
 # MODEL PREDICTION SETTINGS
 # ============================================================================
 # How many days ahead to predict price movement
-prediction_horizon_days: 3
+prediction_horizon_days: 5
 
 # Minimum confidence threshold for generating signals (0.0 to 1.0)
 # Only signals above this threshold will be acted upon
@@ -189,7 +189,7 @@ backtesting:
   entry_threshold: 0.65
   
   # Holding period (days)
-  holding_period: 3
+  holding_period: 5
   
   # Stop loss (ATR multiplier)
   stop_loss_atr: 2.0

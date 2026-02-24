@@ -154,14 +154,14 @@ class FeatureEngineer:
         self.df['breakout_signal'] = ((close > high_20d.shift(1)) & 
                                       (self.df['volume_ratio'] > 1.5)).astype(int)
         
-    def add_target_variables(self, horizon: int = 3):
+    def add_target_variables(self, horizon: int = 5):
         """Target for ML: price up/down in N days"""
         close = self.df['Close']
-        
+
         # Binary target: 1 if price goes up
         future_price = close.shift(-horizon)
-        self.df['target_3d'] = (future_price > close).astype(int)
-        
+        self.df['target_5d'] = (future_price > close).astype(int)
+
         # Magnitude target: % change
         self.df['target_magnitude'] = ((future_price - close) / close) * 100
         
@@ -192,10 +192,11 @@ class FeatureEngineer:
         if existing_macro:
             self.df[existing_macro] = self.df[existing_macro].ffill().bfill()
 
-        # Drop rows with NaN (from indicators that need warmup)
+        # Drop warmup rows (first 250) and last 5 (for 5-day target)
         initial_rows = len(self.df)
-        self.df = self.df.dropna()
-        logger.info(f"Dropped {initial_rows - len(self.df)} warmup rows, {len(self.df)} remaining")
+        self.df = self.df.iloc[250:-5]
+        self.df = self.df.ffill().fillna(0)
+        logger.info(f"Kept {len(self.df)} rows after warmup (dropped {initial_rows - len(self.df)})")
         
         return self.df
 
