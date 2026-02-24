@@ -91,7 +91,7 @@ class FeatureEngineer:
         
         # BB Squeeze (band width in lowest 20% of last 90 days)
         bb_width = self.df['BB_upper'] - self.df['BB_lower']
-        bb_width_percentile = bb_width.rolling(90).apply(lambda x: (x[-1] > x).mean())
+        bb_width_percentile = bb_width.rolling(90).apply(lambda x: (x.iloc[-1] > x).mean())
         self.df['BB_squeeze'] = (bb_width_percentile < 0.20).astype(int)
         
         # Historical Volatility (annualized)

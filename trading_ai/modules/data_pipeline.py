@@ -109,19 +109,27 @@ class DataPipeline:
         
         if kaggle_df.empty and yfinance_df.empty:
             raise ValueError(f"No data found for {ticker}")
-        
+
         if kaggle_df.empty:
             return yfinance_df
-        
+
         if yfinance_df.empty:
             return kaggle_df
-        
-        # Merge: yfinance overwrites overlapping dates
+
+        # Strip timezone from both before merging.
+        # Kaggle CSVs are tz-naive; yfinance returns a UTC-aware index.
+        # Concatenating mixed-tz indices silently drops or misaligns the
+        # yfinance rows, so the 2018-present data never makes it into the parquet.
+        kaggle_df.index = pd.to_datetime(kaggle_df.index).tz_localize(None)
+        yfinance_df.index = pd.to_datetime(yfinance_df.index).tz_localize(None)
+
+        # Merge: yfinance overwrites overlapping dates (keep='last')
         combined = pd.concat([kaggle_df, yfinance_df])
         combined = combined[~combined.index.duplicated(keep='last')]
         combined = combined.sort_index()
-        
-        logger.info(f"Merged {len(combined)} rows for {ticker}")
+
+        logger.info(f"Merged {len(combined)} rows for {ticker} "
+                    f"({combined.index.min().date()} to {combined.index.max().date()})")
         return combined
     
     def load_fred_macro_data(self) -> pd.DataFrame:
