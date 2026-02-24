@@ -1,0 +1,433 @@
+You are a senior quantitative developer and AI architect. I want you to build me a 
+professional-grade AI trading signal system from scratch, in phases, using Python. 
+This is a long-term project. Do NOT write everything at once — build it phase by phase, 
+confirm each phase works before moving to the next, and write clean, modular, 
+well-commented code throughout.
+
+The goal: an AI system that analyzes stocks and ETFs, generates high-confidence 
+directional signals (bullish/bearish/neutral), scores options trade setups, and uses 
+a live LLM (Claude API via Anthropic) to synthesize all signals into a final human-readable 
+trade recommendation — just like a seasoned trader with 180 IQ would.
+
+---
+
+## ARCHITECTURE OVERVIEW
+
+The system has 6 modules:
+
+1. DATA PIPELINE — loads, cleans, and enriches all data sources
+2. FEATURE ENGINEERING — computes all technical indicators and derived features
+3. ML MODEL LAYER — XGBoost classifier + LSTM for directional prediction
+4. OPTIONS ANALYZER — scores options setups using IV, Greeks logic, earnings calendar
+5. LLM SYNTHESIS ENGINE — sends enriched context to Claude API for final trade recommendation
+6. DASHBOARD / OUTPUT — clean CLI output + optional Streamlit dashboard
+
+---
+
+## PHASE 1 — PROJECT STRUCTURE & ENVIRONMENT SETUP
+
+Create the following folder structure:
+
+trading_ai/
+├── data/
+│   ├── raw/           # raw CSVs from Kaggle and other sources
+│   ├── processed/     # cleaned and feature-engineered data
+│   └── cache/         # API response cache to avoid rate limits
+├── models/
+│   ├── xgboost/       # saved XGBoost models
+│   └── lstm/          # saved LSTM models
+├── modules/
+│   ├── data_pipeline.py
+│   ├── feature_engineering.py
+│   ├── ml_models.py
+│   ├── options_analyzer.py
+│   ├── llm_synthesis.py
+│   └── backtester.py
+├── config/
+│   └── config.yaml    # all API keys, settings, thresholds
+├── outputs/
+│   └── signals/       # daily output files
+├── dashboard.py       # Streamlit UI
+├── main.py            # entry point
+├── requirements.txt
+└── .env               # API keys (gitignored)
+
+Create requirements.txt with these packages:
+pandas, numpy, scikit-learn, xgboost, tensorflow, ta, yfinance, 
+requests, python-dotenv, streamlit, plotly, anthropic, kagglehub, 
+fredapi, newsapi-python, scipy, joblib, pyyaml, alpaca-trade-api,
+openai, httpx, aiohttp, asyncio
+
+Create a .env template with placeholders:
+ANTHROPIC_API_KEY=
+ALPHA_VANTAGE_KEY=
+FRED_API_KEY=
+NEWS_API_KEY=
+ALPACA_API_KEY=
+ALPACA_SECRET_KEY=
+FINNHUB_API_KEY=
+
+Create config/config.yaml with:
+- watchlist: [NVDA, QQQ, SPY, AAPL, MSFT, TSLA, AMD, META, AMZN, GOOGL]
+- prediction_horizon_days: 3
+- confidence_threshold: 0.65
+- options_dte_min: 14
+- options_dte_max: 45
+- max_portfolio_risk_pct: 0.05
+- llm_model: "claude-opus-4-6"
+
+---
+
+## PHASE 2 — DATA PIPELINE (data_pipeline.py)
+
+Build a DataPipeline class that loads and merges data from these sources:
+
+### Source 1 — Kaggle Historical OHLCV (Primary)
+Use kagglehub to download: "borismarjanovic/price-volume-data-for-all-us-stocks-etfs"
+Load the CSV for any ticker in the watchlist. Parse Date, Open, High, Low, Close, Volume.
+This gives us deep historical data going back 20+ years for backtesting.
+
+### Source 2 — yfinance (Recent + Live Data)
+Use yfinance to pull the last 2 years of daily OHLCV for any ticker.
+Also pull: options chain (calls + puts), earnings dates, institutional holders, 
+info dict (sector, market cap, forward PE, beta).
+Merge yfinance recent data ON TOP of the Kaggle historical data to create 
+one unified dataframe per ticker.
+
+### Source 3 — FRED API (Macro Data) [FREE]
+API: https://fred.stlouisfed.org/docs/api/fred/
+Key metrics to pull daily/weekly:
+- DFF: Federal Funds Rate
+- VIXCLS: VIX index (fear gauge)
+- T10YIE: 10-year inflation expectations
+- UNRATE: Unemployment rate
+- CPIAUCSL: CPI inflation
+- DGS10: 10-year treasury yield
+Merge these into the main dataframe on date. These are powerful macro signals.
+Get a free key at: https://fred.stlouisfed.org/docs/api/api_key.html
+
+### Source 4 — Alpha Vantage (Earnings + Fundamentals) [FREE tier: 25 req/day]
+API: https://www.alphavantage.co/documentation/
+Pull for each ticker:
+- EARNINGS: historical EPS beat/miss history + estimate vs actual
+- OVERVIEW: P/E, PEG ratio, profit margins, revenue growth
+- RSI, MACD from their technical indicator endpoints as a sanity check
+Free key at: https://www.alphavantage.co/support/#api-key
+
+### Source 5 — Finnhub (Sentiment + News + Insider Trading) [FREE]
+API: https://finnhub.io/docs/api
+Pull:
+- /news-sentiment: bullish/bearish score for each ticker from recent news
+- /stock/insider-transactions: insider buy/sell activity (massive signal)
+- /stock/recommendation: analyst upgrade/downgrade data
+- /company-earnings: upcoming earnings dates and estimates
+Free key at: https://finnhub.io/register
+
+### Source 6 — NewsAPI (Headline Sentiment) [FREE tier]
+API: https://newsapi.org/docs
+Pull last 7 days of headlines for each ticker symbol.
+We will pass raw headlines to Claude later for sentiment scoring.
+Free key at: https://newsapi.org/register
+
+### Data Pipeline Requirements:
+- Cache all API responses to data/cache/ with a 24-hour TTL to avoid rate limits
+- Handle missing data gracefully with forward-fill then backfill
+- Normalize all numeric columns using StandardScaler for ML input
+- Output: one clean merged DataFrame per ticker saved to data/processed/{ticker}.parquet
+- Log all data fetch errors to a rotating log file
+
+---
+
+## PHASE 3 — FEATURE ENGINEERING (feature_engineering.py)
+
+Build a FeatureEngineer class. Given a ticker's processed DataFrame, compute ALL of the 
+following features and append them as columns. Use the `ta` library for indicator math.
+
+### Price & Trend Features:
+- EMA_9, EMA_21, EMA_50, EMA_200 (exponential moving averages)
+- SMA_20, SMA_50 (simple moving averages)
+- price_vs_ema9: (close - EMA9) / EMA9 * 100
+- price_vs_ema200: distance from 200 EMA as % — determines bull/bear regime
+- above_200ema: binary 1/0
+- ema9_cross_ema21: 1 when EMA9 crosses above EMA21 (golden cross mini)
+- trend_strength: EMA9 slope over 5 days
+
+### Momentum Features (from Trade Your Way to Financial Freedom — Tharp):
+- ROC_10: Rate of Change over 10 days (velocity indicator)
+- ROC_20: Rate of Change over 20 days  
+- momentum_acceleration: ROC_10 today minus ROC_10 five days ago (acceleration)
+- MACD, MACD_signal, MACD_hist: standard 12/26/9 settings
+- MACD_cross: 1 when MACD crosses above signal line
+- RSI_14: Relative Strength Index
+- RSI_oversold: 1 if RSI < 35
+- RSI_overbought: 1 if RSI > 70
+- Stoch_K, Stoch_D: Stochastic oscillator
+
+### Volatility Features (critical for options — from OptionTradingSuccess textbook):
+- ATR_14: Average True Range (position sizing and stop loss input)
+- BB_upper, BB_lower, BB_mid: Bollinger Bands (20, 2)
+- BB_squeeze: 1 when band width is in the lowest 20% of last 90 days (coiling for breakout)
+- hist_volatility_20: 20-day historical volatility (annualized std of log returns)
+- hist_volatility_60: 60-day historical volatility
+- hv_ratio: hist_volatility_20 / hist_volatility_60 — rising ratio = increasing vol regime
+
+### Volume Features (from How to Day Trade for a Living — Aziz):
+- VWAP: Volume Weighted Average Price (intraday — use daily proxy: sum(close*vol)/sum(vol) rolling)
+- volume_ratio: today's volume / 20-day avg volume
+- volume_spike: 1 if volume_ratio > 2.0
+- OBV: On-Balance Volume
+- OBV_trend: slope of OBV over 10 days
+- price_volume_divergence: price up but OBV down = bearish divergence signal
+
+### Pattern Features:
+- higher_high: 1 if today's high > previous 5-day high
+- higher_low: 1 if today's low > previous 5-day low (uptrend structure)
+- inside_day: 1 if high < yesterday's high AND low > yesterday's low
+- bull_flag_setup: 1 if (strong_uptrend AND low_volatility_consolidation AND volume_declining)
+  - strong_uptrend = price > EMA9 AND EMA9 > EMA21 AND ROC_10 > 5
+  - consolidation = ATR < 14-day avg ATR AND 3 consecutive inside or small-range days
+  - volume_declining = volume < 0.7 * 5-day avg volume
+- breakout_signal: 1 if close > 20-day high AND volume_ratio > 1.5
+
+### Macro Features (joined from FRED):
+- vix_level: raw VIX
+- vix_regime: low (<15), medium (15-25), high (>25), extreme (>35)
+- yield_curve_slope: 10Y treasury - 2Y treasury (negative = recession warning)
+- fed_rate_change: change in fed funds rate over last 30 days
+
+### Fundamental & Sentiment Features:
+- earnings_beat_rate: pct of last 8 quarters where EPS beat estimate (from Alpha Vantage)
+- days_to_earnings: calendar days until next earnings (CRITICAL for options timing)
+- insider_net_buying: net insider buy minus sell dollar value over last 90 days
+- analyst_upgrade_score: weighted score of recent upgrades vs downgrades
+- news_sentiment_score: Finnhub composite sentiment score (-1 to +1)
+
+### Target Variable (for supervised ML):
+- target_3d: 1 if close price 3 days from now is higher than today, else 0
+- target_magnitude: % change in price 3 days out (for regression model)
+- Do NOT include any look-ahead bias — shift all target variables correctly
+
+Save the fully featured DataFrame to data/processed/{ticker}_featured.parquet
+
+---
+
+## PHASE 4 — ML MODEL LAYER (ml_models.py)
+
+Build a ModelManager class with two models:
+
+### Model A: XGBoost Classifier (Primary Signal)
+- Features: all engineered features EXCEPT target columns and raw price columns
+- Target: target_3d (binary classification)
+- Train/test split: use TimeSeriesSplit with 5 folds (never shuffle time series data)
+- Hyperparameter tuning with Optuna (50 trials) optimizing for ROC-AUC
+- Key params to tune: n_estimators, max_depth, learning_rate, subsample, 
+  colsample_bytree, min_child_weight, reg_alpha, reg_lambda
+- After training: save feature importances, save model to models/xgboost/{ticker}.json
+- Output: probability score 0-1 of bullish move in next 3 days
+
+### Model B: LSTM Neural Network (Sequence Memory)
+- Input: rolling 30-day window of [close_normalized, volume_ratio, RSI_14, MACD_hist, 
+  ATR_14, hist_volatility_20, news_sentiment_score]
+- Architecture: 
+  - LSTM layer 1: 128 units, return_sequences=True, dropout=0.2
+  - LSTM layer 2: 64 units, return_sequences=False, dropout=0.2
+  - Dense layer: 32 units, ReLU activation
+  - Output layer: 1 unit, sigmoid activation
+- Loss: binary crossentropy, optimizer: Adam with lr=0.001
+- Early stopping: patience=10, restore best weights
+- Save model to models/lstm/{ticker}.h5
+
+### Ensemble Signal:
+- final_score = (XGBoost_prob * 0.6) + (LSTM_prob * 0.4)
+- signal: "STRONG_BULL" if > 0.72, "BULL" if > 0.62, "NEUTRAL" if 0.45-0.62, 
+  "BEAR" if < 0.38, "STRONG_BEAR" if < 0.28
+- Include confidence interval using bootstrap sampling (100 samples)
+
+### Backtesting (backtester.py):
+Build a simple event-driven backtester:
+- Start with $10,000 paper portfolio
+- Enter when signal > 0.65, exit after 3 days or at stop loss (2x ATR below entry)
+- Track: total return, Sharpe ratio, max drawdown, win rate, avg win/loss ratio
+- Output a backtest report as a CSV and a Plotly equity curve chart
+
+---
+
+## PHASE 5 — OPTIONS ANALYZER (options_analyzer.py)
+
+Build an OptionsAnalyzer class using yfinance options chain data.
+
+For each ticker with a BULL or STRONG_BULL signal, score options setups:
+
+### IV Crush Risk Assessment:
+- Pull current IV from the options chain (use ATM call implied vol)
+- Compare to hist_volatility_20 from our feature set
+- iv_premium_ratio = current_IV / hist_volatility_20
+- If iv_premium_ratio > 1.5 AND days_to_earnings <= 5: flag IV_CRUSH_HIGH_RISK
+- Recommendation: bull call spread over naked call when IV_CRUSH_HIGH_RISK = True
+  (This implements the core lesson from Simple Steps to Option Trading Success — 
+   spreads cut IV crush damage significantly)
+
+### Strike & Expiration Scoring:
+- For each call option in the chain, score it on:
+  - dte_score: highest score for 21-45 DTE (sweet spot per textbook)
+  - moneyness_score: highest for 0.98-1.05x moneyness (slight OTM)
+  - volume_oi_score: option volume / open interest ratio (liquidity check)
+  - delta_score: highest for delta 0.35-0.55 range
+- Composite option_score = weighted average of above 4 scores
+- Recommend top 3 calls by option_score
+- Also recommend the best bull call spread: buy top call, sell call 2 strikes higher
+
+### Options Output per ticker:
+- Recommended long call: {ticker} ${strike} exp {date} — est. premium ${price}
+- Recommended spread: buy ${strike1} / sell ${strike2} — net debit ${net_cost}
+- IV environment: [CHEAP / FAIR / EXPENSIVE]
+- IV crush risk: [HIGH / MEDIUM / LOW]
+- Break-even price needed: ${breakeven}
+- Max loss: ${max_loss} | Max gain: ${max_gain}
+
+---
+
+## PHASE 6 — LLM SYNTHESIS ENGINE (llm_synthesis.py)
+
+Build an LLMSynthesizer class using the Anthropic Python SDK (claude-opus-4-6).
+
+This is the brain of the system. After all data, features, model scores, and options 
+analysis are computed for a ticker, assemble a rich context payload and send it to Claude 
+for final synthesis.
+
+### Context Payload to send Claude:
+```python
+context = f"""
+You are a seasoned quantitative trader with 20 years of experience. 
+You have studied Van Tharp's position sizing principles (Trade Your Way to Financial Freedom),
+Andrew Aziz's momentum and pattern strategies (How to Day Trade for a Living),
+and options trading principles from Simple Steps to Option Trading Success.
+
+Analyze the following data for {ticker} and give a clear, brutally honest trade recommendation.
+
+=== MARKET DATA ===
+Current Price: ${current_price}
+52-Week High/Low: ${week_52_high} / ${week_52_low}
+Today's Volume vs Avg: {volume_ratio:.1f}x
+Days to Earnings: {days_to_earnings}
+
+=== ML MODEL SIGNALS ===
+XGBoost Bullish Probability (3-day): {xgb_prob:.1%}
+LSTM Bullish Probability (3-day): {lstm_prob:.1%}
+Ensemble Score: {final_score:.1%}
+Signal: {signal}
+Confidence Interval: [{ci_low:.1%} - {ci_high:.1%}]
+
+=== TECHNICAL PICTURE ===
+RSI(14): {rsi:.1f}
+MACD Histogram: {macd_hist:.3f} ({'positive momentum' if macd_hist > 0 else 'negative momentum'})
+Price vs EMA200: {price_vs_ema200:+.1f}% ({'above' if above_200ema else 'below'} long-term trend)
+ATR(14): ${atr:.2f} ({(atr/current_price*100):.1f}% daily range)
+Bollinger Band Squeeze: {'YES - coiling for breakout' if bb_squeeze else 'No'}
+Bull Flag Setup: {'YES' if bull_flag_setup else 'No'}
+Volume Spike: {'YES' if volume_spike else 'No'}
+Historical Volatility (20d): {hist_vol_20:.1%}
+Historical Volatility (60d): {hist_vol_60:.1%}
+HV Ratio: {hv_ratio:.2f} ({'rising vol regime' if hv_ratio > 1 else 'falling vol regime'})
+
+=== MACRO ENVIRONMENT ===
+VIX: {vix:.1f} (regime: {vix_regime})
+10Y Yield: {yield_10y:.2f}%
+Yield Curve Slope: {yield_curve:.2f}% ({'normal' if yield_curve > 0 else 'INVERTED - caution'})
+Fed Funds Rate Change (30d): {fed_change:+.2f}%
+
+=== FUNDAMENTALS & SENTIMENT ===
+Earnings Beat Rate (last 8Q): {earnings_beat_rate:.0%}
+Insider Net Buying (90d): ${insider_net:,.0f}
+Analyst Upgrade/Downgrade Score: {analyst_score:.2f} (-1 bear to +1 bull)
+News Sentiment Score: {news_sentiment:.2f}
+Recent Headlines: {headlines_text}
+
+=== OPTIONS ANALYSIS ===
+IV vs Historical Vol Ratio: {iv_premium_ratio:.2f}x
+IV Crush Risk: {iv_crush_risk}
+Top Call Recommendation: ${call_strike} exp {call_exp}, ~${call_premium:.2f} premium
+Top Spread Recommendation: ${spread_low}/${spread_high}, ~${spread_cost:.2f} net debit
+Option Score: {option_score:.2f}/1.0
+
+=== POSITION SIZING (Van Tharp Method) ===
+Account Size: $1,000
+Max Risk Per Trade (5%): $50
+ATR Stop Distance: ${atr_stop:.2f}
+Suggested Position: {position_suggestion}
+
+Please provide:
+1. OVERALL VERDICT: [STRONG BUY / BUY / HOLD / AVOID / SHORT] with one sentence rationale
+2. HIGHEST PROBABILITY TRADE SETUP: Exact entry, target, stop loss
+3. OPTIONS RECOMMENDATION: Specific call or spread to buy with exact strike and expiry
+4. RISK FACTORS: Top 3 reasons this trade could fail
+5. ALTERNATIVE: If you would NOT take this trade, what would you do instead?
+6. CONFIDENCE: Your overall confidence in this setup on a scale of 1-10
+
+Be direct, specific, and numerical. No vague language.
+"""
+```
+
+Call the Claude API:
+```python
+import anthropic
+
+client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+response = client.messages.create(
+    model="claude-opus-4-6",
+    max_tokens=1500,
+    messages=[{"role": "user", "content": context}]
+)
+recommendation = response.content[0].text
+```
+
+Cache the response with the ticker + date as key to avoid redundant API calls.
+Save the raw recommendation to outputs/signals/{ticker}_{date}.txt
+
+---
+
+## PHASE 7 — MAIN ORCHESTRATOR (main.py)
+
+Build a main() function that:
+1. Reads watchlist from config.yaml
+2. For each ticker: runs DataPipeline → FeatureEngineer → ModelManager → OptionsAnalyzer → LLMSynthesizer
+3. Ranks all tickers by final_score descending
+4. Prints a clean summary table to console showing:
+   - Ticker | Signal | Ensemble Score | IV Risk | Top Option | Claude Verdict | Confidence
+5. Saves full output to outputs/signals/daily_report_{date}.csv
+6. Accepts CLI args: --ticker NVDA (single ticker mode), --backtest (run backtest mode)
+7. Handles all API errors gracefully with retries (exponential backoff)
+
+---
+
+## PHASE 8 — STREAMLIT DASHBOARD (dashboard.py)
+
+Build a Streamlit app with:
+- Sidebar: ticker selector, date range, signal threshold slider
+- Main panel: 
+  - Plotly candlestick chart with EMA9/21/200 and Bollinger Bands overlaid
+  - Signal gauge chart (0-100 bullish score)
+  - Feature importance bar chart from XGBoost
+  - Options chain table with top-scored options highlighted
+  - Claude's recommendation displayed in a styled info box
+  - Backtest equity curve chart
+- Auto-refreshes every 60 seconds when market is open (9:30-4pm ET weekdays)
+
+---
+
+## DEVELOPMENT RULES — FOLLOW THESE STRICTLY:
+
+1. Build ONE phase at a time. Do not start Phase 2 until Phase 1 is tested and confirmed working.
+2. Write unit tests for every class method in a /tests/ folder using pytest.
+3. Never hardcode API keys — always use os.getenv() from .env file.
+4. Always use try/except with specific error types and meaningful log messages.
+5. All DataFrames must be validated: check for nulls, check date continuity, check min rows.
+6. Log everything to logs/trading_ai.log with timestamp, level, and module name.
+7. The system must run on Python 3.10+.
+8. Comment every non-obvious line of code. This is a learning project too.
+
+---
+
+Start with Phase 1. Create the full folder structure, requirements.txt, .env template, 
+and config.yaml. Then confirm with me before proceeding to Phase 2.
