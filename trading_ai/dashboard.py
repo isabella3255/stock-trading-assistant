@@ -159,7 +159,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### ⚡ Quick Actions")
 
-    run_pipeline = st.button("🔄 Refresh Data & Run Pipeline", use_container_width=True)
+    run_pipeline = st.button("🔄 Refresh Data & Run Pipeline", width='stretch')
     if run_pipeline:
         with st.spinner(f"Running pipeline for {ticker}…"):
             import subprocess
@@ -173,7 +173,7 @@ with st.sidebar:
             else:
                 st.error(f"Pipeline failed:\n{result.stderr[-500:]}")
 
-    run_llm = st.button("🤖 Run Full Analysis (with LLM)", use_container_width=True)
+    run_llm = st.button("🤖 Run Full Analysis (with LLM)", width='stretch')
     if run_llm:
         with st.spinner(f"Running LLM analysis for {ticker}…"):
             import subprocess
@@ -187,7 +187,7 @@ with st.sidebar:
             else:
                 st.error(f"LLM failed:\n{result.stderr[-500:]}")
 
-    run_all = st.button("🏃 Run All 10 Tickers", use_container_width=True)
+    run_all = st.button("🏃 Run All 10 Tickers", width='stretch')
     if run_all:
         with st.spinner("Running all tickers (no LLM)…"):
             import subprocess
@@ -405,7 +405,7 @@ with tabs[1]:
                 legend=dict(orientation="h", y=1.02),
                 margin=dict(l=40, r=40, t=60, b=40),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         except ImportError:
             st.error("plotly not installed. Run: pip install plotly")
@@ -459,7 +459,7 @@ with tabs[2]:
             "Value":      ["0.534",       "0.531",    "~0.540",             "5 trading days",    "50,513 (10 tickers)"],
             "Benchmark":  ["0.500 (random)", "0.500", "0.500",              "—",                 "—"],
         }
-        st.dataframe(pd.DataFrame(perf_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(perf_data), width='stretch', hide_index=True)
 
         st.info("**Note**: AUC of 0.53–0.54 is realistic for financial markets. Professional quant funds "
                 "typically target 53–57% win rates. The real edge comes from position sizing, "
@@ -531,7 +531,7 @@ with tabs[3]:
                                     "OI": c.get("openInterest", 0),
                                     "Score": f"{c['score']:.3f}",
                                 })
-                            st.dataframe(pd.DataFrame(calls_data), use_container_width=True, hide_index=True)
+                            st.dataframe(pd.DataFrame(calls_data), width='stretch', hide_index=True)
 
                         # Best Spread
                         spread = result.get("best_spread")
@@ -613,7 +613,7 @@ with tabs[5]:
                 margin=dict(l=200, r=40, t=60, b=40),
                 showlegend=False,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
             # Category summary
             st.markdown("#### Feature Categories")
@@ -640,7 +640,7 @@ with tabs[5]:
                     "Total Importance": f"{subset['importance'].sum():.3f}",
                     "Top Feature": subset.iloc[0]["feature"] if len(subset) > 0 else "—",
                 })
-            st.dataframe(pd.DataFrame(cat_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(cat_rows), width='stretch', hide_index=True)
 
         except ImportError:
             st.error("plotly not installed.")
@@ -678,15 +678,15 @@ with tabs[6]:
         styled = (
             report[display_cols]
             .style
-            .applymap(color_signal, subset=["signal"] if "signal" in display_cols else [])
-            .applymap(color_score, subset=["score"] if "score" in display_cols else [])
+            .map(color_signal, subset=["signal"] if "signal" in display_cols else [])
+            .map(color_score, subset=["score"] if "score" in display_cols else [])
             .format({
                 "score":    "{:.3f}",
                 "xgb_prob": "{:.3f}",
                 "seq_prob": "{:.3f}",
             }, na_rep="N/A")
         )
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.dataframe(styled, width='stretch', hide_index=True)
 
         # Signal distribution pie
         st.markdown("---")
@@ -703,7 +703,7 @@ with tabs[6]:
                 title="Current Signal Distribution",
             )
             fig.update_layout(template="plotly_dark")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         except ImportError:
             st.dataframe(report["signal"].value_counts())
 
@@ -804,7 +804,7 @@ with tabs[7]:
                             fig.add_hline(y=initial_cap, line_dash="dot",
                                           annotation_text="Starting Capital")
                             fig.update_layout(template="plotly_dark")
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, width='stretch')
                         except ImportError:
                             st.line_chart(equity)
 
