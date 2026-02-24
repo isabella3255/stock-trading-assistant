@@ -21,7 +21,6 @@ from typing import Dict, Optional, List
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from fredapi import Fred
 import requests
 from dotenv import load_dotenv
 
@@ -47,8 +46,7 @@ class DataPipeline:
         self.cache_dir = Path("data/cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # API clients
-        self.fred = Fred(api_key=os.getenv('FRED_API_KEY'))
+        self.fred_api_key = os.getenv('FRED_API_KEY')
         
     def load_kaggle_data(self, ticker: str) -> pd.DataFrame:
         """Load historical data from Kaggle CSV files"""
@@ -150,7 +148,11 @@ class DataPipeline:
                 return df
         
         logger.info("Fetching FRED macro data")
-        
+
+        if not self.fred_api_key:
+            logger.warning("FRED_API_KEY not set, skipping macro data")
+            return pd.DataFrame()
+
         indicators = {
             'VIX': 'VIXCLS',
             'FED_RATE': 'DFF',
@@ -159,25 +161,38 @@ class DataPipeline:
             'CPI': 'CPIAUCSL',
             'UNEMPLOYMENT': 'UNRATE'
         }
-        
+
         macro_data = {}
         start_date = (datetime.now() - timedelta(days=365*5)).strftime('%Y-%m-%d')
-        
+
         for name, series_id in indicators.items():
             try:
-                series = self.fred.get_series(series_id, observation_start=start_date)
-                macro_data[name] = series
+                # Use requests directly to avoid fredapi's SSL cert issues on macOS
+                url = (
+                    f"https://api.stlouisfed.org/fred/series/observations"
+                    f"?series_id={series_id}&api_key={self.fred_api_key}"
+                    f"&file_type=json&observation_start={start_date}"
+                )
+                response = requests.get(url, timeout=15)
+                obs = response.json().get('observations', [])
+                # Filter out missing values (FRED uses '.' for N/A)
+                valid = {o['date']: float(o['value']) for o in obs if o['value'] != '.'}
+                if valid:
+                    series = pd.Series(valid)
+                    series.index = pd.to_datetime(series.index)
+                    macro_data[name] = series
+                    logger.info(f"FRED {name}: {len(series)} observations")
             except Exception as e:
-                logger.warning(f"Failed to fetch {name}: {e}")
+                logger.warning(f"Failed to fetch FRED {name}: {e}")
         
         if not macro_data:
             return pd.DataFrame()
         
         df = pd.DataFrame(macro_data)
         
-        # Cache it
+        # Cache it — convert Timestamp index to strings so json.dump doesn't crash
         cache_data = df.copy()
-        cache_data['index'] = df.index.astype(str)
+        cache_data.index = cache_data.index.astype(str)
         with open(cache_file, 'w') as f:
             json.dump(cache_data.to_dict(), f)
         
@@ -310,6 +325,8 @@ class DataPipeline:
                 'market_cap': info.get('marketCap', 0),
                 'beta': info.get('beta', 1.0),
                 'forward_pe': info.get('forwardPE', None),
+                'week_52_high': info.get('fiftyTwoWeekHigh', None),
+                'week_52_low': info.get('fiftyTwoWeekLow', None),
             }
             
             # Get next earnings date
@@ -360,7 +377,12 @@ class DataPipeline:
         finnhub_data = self.load_finnhub_data(ticker)
         if finnhub_data.get('sentiment'):
             sentiment = finnhub_data['sentiment']
-            df['NEWS_SENTIMENT'] = sentiment.get('sentiment', {}).get('score', 0)
+            # Finnhub returns: {"buzz":{...}, "sentiment":{"bearishPercent":x,"bullishPercent":y}}
+            # The composite score is bullishPercent - bearishPercent, ranging -1 to +1
+            sent_data = sentiment.get('sentiment', {})
+            bull_pct = sent_data.get('bullishPercent', 0) or 0
+            bear_pct = sent_data.get('bearishPercent', 0) or 0
+            df['NEWS_SENTIMENT'] = float(bull_pct) - float(bear_pct)
         
         # 5. Store metadata (for later use)
         metadata = self.get_yfinance_metadata(ticker)
