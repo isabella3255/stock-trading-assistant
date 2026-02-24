@@ -134,7 +134,7 @@ api_rate_limits:
 data_pipeline:
   # Kaggle data source
   use_kaggle_api: false  # Set to false to use local files instead of API
-  kaggle_data_path: "data/raw/kaggle"  # Path to local Kaggle CSV files
+  kaggle_data_path: "../KaggleData"  # Path to local Kaggle CSV files
   
   # Cache TTL for API responses (hours)
   cache_ttl_hours: 24
