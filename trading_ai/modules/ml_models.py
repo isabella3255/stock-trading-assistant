@@ -229,6 +229,17 @@ class ModelManager:
         if df is None:
             df = self.df
 
+        # Filter feature_cols to only those present in df — ticker_id is added during
+        # multi-ticker combined training but won't exist in single-ticker inference DataFrames.
+        # Missing columns are filled with 0 (neutral / not applicable).
+        available_cols = [c for c in self.feature_cols if c in df.columns]
+        missing_cols   = [c for c in self.feature_cols if c not in df.columns]
+        if missing_cols:
+            logger.debug(f"predict(): filling {len(missing_cols)} missing features with 0: {missing_cols}")
+            df = df.copy()
+            for c in missing_cols:
+                df[c] = 0
+
         # XGBoost — score the last row
         X_all = df[self.feature_cols].values
         xgb_prob = float(self.xgb_model.predict_proba(X_all)[:, 1][-1])
