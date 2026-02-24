@@ -390,8 +390,87 @@ class ModelManager:
         logger.info(f"Loaded models for {ticker}")
 
 
+def tune_xgboost(manager: "ModelManager", n_trials: int = 50) -> dict:
+    """
+    Optuna hyperparameter search for XGBoost.
+
+    Searches over key hyperparameters with TimeSeriesSplit — no look-ahead bias.
+    Returns the best params dict. Call manager.train_xgboost() with these params
+    by temporarily patching the classifier kwargs.
+
+    Usage:
+        combined_df, _ = load_combined_df(tickers)
+        manager = ModelManager(combined_df)
+        manager.prepare_data()
+        best = tune_xgboost(manager, n_trials=50)
+        print("Best params:", best)
+
+    Note: Tuning 50 trials on 50k rows takes ~5-10 minutes.
+    """
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError:
+        logger.error("optuna not installed. Run: pip install optuna")
+        return {}
+
+    import xgboost as xgb_lib
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import TimeSeriesSplit
+
+    def objective(trial):
+        params = {
+            'n_estimators':      trial.suggest_int('n_estimators', 200, 800),
+            'max_depth':         trial.suggest_int('max_depth', 3, 6),
+            'learning_rate':     trial.suggest_float('learning_rate', 0.005, 0.05, log=True),
+            'subsample':         trial.suggest_float('subsample', 0.5, 0.9),
+            'colsample_bytree':  trial.suggest_float('colsample_bytree', 0.4, 0.8),
+            'min_child_weight':  trial.suggest_int('min_child_weight', 3, 15),
+            'gamma':             trial.suggest_float('gamma', 0.0, 0.5),
+            'reg_alpha':         trial.suggest_float('reg_alpha', 0.0, 1.0),
+            'reg_lambda':        trial.suggest_float('reg_lambda', 0.5, 5.0),
+        }
+
+        tscv = TimeSeriesSplit(n_splits=5)
+        aucs = []
+        for train_idx, test_idx in tscv.split(manager.X):
+            X_tr, X_te = manager.X[train_idx], manager.X[test_idx]
+            y_tr, y_te = manager.y[train_idx], manager.y[test_idx]
+            neg = (y_tr == 0).sum()
+            pos = (y_tr == 1).sum()
+            spw = neg / pos if pos > 0 else 1.0
+            clf = xgb_lib.XGBClassifier(
+                **params,
+                scale_pos_weight=spw,
+                random_state=42,
+                eval_metric='auc',
+                early_stopping_rounds=20,
+            )
+            clf.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False)
+            preds = clf.predict_proba(X_te)[:, 1]
+            aucs.append(roc_auc_score(y_te, preds))
+        return float(np.mean(aucs))
+
+    study = optuna.create_study(direction='maximize',
+                                sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    best = study.best_params
+    logger.info(f"Optuna best AUC: {study.best_value:.4f}")
+    logger.info(f"Best params: {best}")
+    return best
+
+
 if __name__ == "__main__":
+    import argparse
     logging.basicConfig(level=logging.INFO)
+
+    parser = argparse.ArgumentParser(description="Train ML models for the trading system")
+    parser.add_argument("--tune", action="store_true",
+                        help="Run Optuna hyperparameter tuning before training (takes ~5-10 min)")
+    parser.add_argument("--tune-trials", type=int, default=50,
+                        help="Number of Optuna trials (default: 50)")
+    args = parser.parse_args()
 
     import yaml
     with open("config/config.yaml", 'r') as f:
@@ -411,7 +490,41 @@ if __name__ == "__main__":
     manager = ModelManager(combined_df)
     manager.per_ticker_norm_stats = norm_stats  # pass per-ticker stats before training
     manager.prepare_data()
-    manager.train_xgboost()
+
+    if args.tune:
+        logger.info(f"Running Optuna tuning ({args.tune_trials} trials)…")
+        best_params = tune_xgboost(manager, n_trials=args.tune_trials)
+        logger.info(f"Best XGBoost params: {best_params}")
+        # Patch the XGBoost training to use tuned params
+        import xgboost as xgb_lib
+        neg_count = (manager.y == 0).sum()
+        pos_count = (manager.y == 1).sum()
+        spw = neg_count / pos_count if pos_count > 0 else 1.0
+        from sklearn.model_selection import TimeSeriesSplit
+        tscv = TimeSeriesSplit(n_splits=5)
+        train_idx, test_idx = list(tscv.split(manager.X))[-1]
+        manager.xgb_model = xgb_lib.XGBClassifier(
+            **best_params,
+            scale_pos_weight=spw,
+            random_state=42,
+            eval_metric='auc',
+            early_stopping_rounds=20,
+        )
+        manager.xgb_model.fit(
+            manager.X[train_idx], manager.y[train_idx],
+            eval_set=[(manager.X[test_idx], manager.y[test_idx])],
+            verbose=False,
+        )
+        from sklearn.metrics import roc_auc_score
+        preds = manager.xgb_model.predict_proba(manager.X[test_idx])[:, 1]
+        logger.info(f"Tuned XGBoost Test AUC: {roc_auc_score(manager.y[test_idx], preds):.4f}")
+        manager.feature_importance = pd.DataFrame({
+            'feature': manager.feature_cols,
+            'importance': manager.xgb_model.feature_importances_
+        }).sort_values('importance', ascending=False)
+    else:
+        manager.train_xgboost()
+
     manager.train_seq_model()
 
     result = manager.predict()

@@ -40,9 +40,9 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
         df = pipeline.process_ticker(ticker)
 
         # Pull live headlines from pipeline (cached, no extra API quota cost)
+        # load_newsapi_headlines() returns a list directly (not a dict)
         try:
-            news_data = pipeline.get_news_data(ticker)
-            headlines = news_data.get('headlines', [])[:5]
+            headlines = pipeline.load_newsapi_headlines(ticker)[:5]
         except Exception:
             headlines = []
 
@@ -55,17 +55,23 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
         manager = ModelManager(df_featured)
         manager.prepare_data()
 
-        # Try to load existing models using load_models() — this correctly restores
-        # feature_cols, MLP, scaler, and norm stats. Old raw joblib.load path was
-        # leaving feature_cols=None (crash) and skipping MLP load entirely.
-        xgb_path = f"models/xgboost/{ticker}.pkl"
-        if Path(xgb_path).exists():
+        # Model loading priority:
+        #   1. Per-ticker model (e.g. TSLA.pkl) — use if it exists
+        #   2. Combined model (NVDA.pkl) — trained on all 10 tickers (50,513 rows,
+        #      XGB AUC 0.534, MLP AUC 0.537). predict() fills missing ticker_id with 0.
+        #   3. Train fresh (last resort — small datasets produce sub-random AUC)
+        xgb_path = Path(f"models/xgboost/{ticker}.pkl")
+        combined_path = Path("models/xgboost/NVDA.pkl")
+        if xgb_path.exists():
             logger.info(f"Loading existing models for {ticker}")
             manager.load_models(ticker)
+        elif combined_path.exists():
+            logger.info(f"No per-ticker model for {ticker} — loading combined model (NVDA, 50k rows)")
+            manager.load_models("NVDA")
         else:
             logger.info(f"No saved models found for {ticker}, training now...")
             manager.train_xgboost()
-            manager.train_seq_model()   # train MLP too (was missing in original fallback)
+            manager.train_seq_model()
             manager.save_models(ticker)
 
         # Get prediction
@@ -156,13 +162,51 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
         return {'ticker': ticker, 'success': False, 'error': str(e)}
 
 
+def delete_per_ticker_models():
+    """
+    Delete all per-ticker model files, keeping only the combined NVDA model.
+    This forces main.py to use the 50,513-row combined model for all tickers
+    instead of stale per-ticker files with sub-random AUC.
+    """
+    tickers_to_remove = ['QQQ', 'SPY', 'AAPL', 'MSFT', 'TSLA', 'AMD', 'META', 'AMZN', 'GOOGL']
+    patterns = [
+        ("models/xgboost", ["{t}.pkl", "{t}_importance.csv"]),
+        ("models/lstm",    ["{t}_seq.pkl", "{t}_scaler.pkl", "{t}_norm_stats.pkl"]),
+    ]
+    deleted = []
+    for folder, templates in patterns:
+        for ticker in tickers_to_remove:
+            for tmpl in templates:
+                path = Path(folder) / tmpl.replace("{t}", ticker)
+                if path.exists():
+                    path.unlink()
+                    deleted.append(str(path))
+
+    if deleted:
+        logger.info(f"Deleted {len(deleted)} stale per-ticker model file(s):")
+        for f in deleted:
+            logger.info(f"  removed: {f}")
+    else:
+        logger.info("No stale per-ticker model files found to delete.")
+
+
 def main():
     """Main orchestrator"""
     parser = argparse.ArgumentParser(description="AI Trading Signal System")
     parser.add_argument("--ticker", type=str, help="Analyze single ticker")
     parser.add_argument("--backtest", action="store_true", help="Run backtesting (not yet implemented)")
     parser.add_argument("--no-llm", action="store_true", help="Skip LLM synthesis")
+    parser.add_argument(
+        "--delete-models",
+        action="store_true",
+        help="Delete all per-ticker model files before running (keeps combined NVDA model)",
+    )
     args = parser.parse_args()
+
+    # Delete stale per-ticker models if requested
+    if args.delete_models:
+        logger.info("--delete-models flag set: removing stale per-ticker model files...")
+        delete_per_ticker_models()
 
     # Load config
     with open("config/config.yaml", 'r') as f:
