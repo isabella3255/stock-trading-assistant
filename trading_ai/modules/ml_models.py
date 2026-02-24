@@ -30,8 +30,15 @@ logger = logging.getLogger(__name__)
 def load_combined_df(tickers: list, base_path: str = "data/processed"):
     """
     Load all ticker featured parquets and concatenate into one DataFrame.
-    Normalizes Close per-ticker before combining (price scales differ: NVDA ~$800,
-    SPY ~$500, AAPL ~$190). Returns the combined DataFrame and per-ticker norm stats.
+
+    close_norm_pretrained is computed as a rolling 20-day z-score of the Close price.
+    This is stationary regardless of long-term price level drift (e.g. AMD went from
+    $18 to $200+). At inference time predict() applies the same rolling z-score so
+    the MLP always sees values in a consistent range. The old approach (global mean/std
+    per ticker) caused extreme z-scores (AMD z=5+) which saturated the MLP sigmoid.
+
+    Returns the combined DataFrame and an empty norm_stats dict (kept for API
+    compatibility — per_ticker_norm_stats is no longer needed for normalization).
     """
     dfs = []
     norm_stats = {}
@@ -41,11 +48,14 @@ def load_combined_df(tickers: list, base_path: str = "data/processed"):
             logger.warning(f"Missing {path}, skipping {ticker}")
             continue
         df = pd.read_parquet(path)
-        m = df['Close'].mean()
-        s = df['Close'].std()
-        norm_stats[ticker] = {'mean': float(m), 'std': float(s)}
-        df['close_norm_pretrained'] = (df['Close'] - m) / s
+        # Rolling 20-day z-score: each price is normalized relative to its own
+        # recent history, so the value is stationary across all price regimes.
+        roll_mean = df['Close'].rolling(20, min_periods=1).mean()
+        roll_std  = df['Close'].rolling(20, min_periods=1).std().fillna(1.0)
+        roll_std  = roll_std.replace(0, 1.0)  # avoid divide-by-zero
+        df['close_norm_pretrained'] = (df['Close'] - roll_mean) / roll_std
         df['ticker_id'] = i
+        norm_stats[ticker] = {}   # placeholder — rolling z-score needs no stored stats
         dfs.append(df)
         logger.info(f"Loaded {ticker}: {len(df)} rows")
 
@@ -69,9 +79,12 @@ class ModelManager:
         self.feature_cols = None
         self.window_size = 20       # rolling window for sequence model
 
-        # Stored at train time so predict() uses the exact same normalization
+        # Stored at train time so predict() uses the exact same normalization.
+        # For single-ticker training: scalar mean/std of the training df's Close.
+        # For multi-ticker training: self.per_ticker_norm_stats[ticker] = {mean, std}.
         self.close_norm_mean = None
         self.close_norm_std = None
+        self.per_ticker_norm_stats = {}  # populated by load_combined_df + save_models
         self._seq_feature_cols = None   # set in _build_sequences
         self._seq_optional_cols = None
 
@@ -146,30 +159,48 @@ class ModelManager:
         Build rolling window sequences from key time-series features.
         Returns flattened (n_samples, window * n_features) arrays for the MLP.
 
-        Uses close_norm_pretrained if present (multi-ticker path where each ticker's
-        Close was normalized before concatenation). Otherwise normalizes here and
-        stores the stats on self for consistent predict-time reuse.
+        close_norm uses a rolling 20-day z-score so that it is stationary across all
+        price regimes (e.g. AMD at $18 in 2003 vs $200 in 2024). This avoids the
+        out-of-distribution issue where per-ticker global mean/std produced z-scores
+        of 4–5 for recent prices, saturating the MLP sigmoid to 0.0 or 1.0.
+        The same rolling z-score is applied at predict() time for consistency.
         """
+        # Compute rolling z-score: works for both single- and multi-ticker DataFrames.
+        # If close_norm_pretrained is already present (from load_combined_df), reuse it
+        # directly — it was computed with the same rolling formula.
         if 'close_norm_pretrained' in self.df.columns:
             close_norm = self.df['close_norm_pretrained']
-            # For multi-ticker, norm stats are per-ticker — store global fallback
-            self.close_norm_mean = self.df['Close'].mean()
-            self.close_norm_std = self.df['Close'].std()
         else:
-            self.close_norm_mean = self.df['Close'].mean()
-            self.close_norm_std = self.df['Close'].std()
-            close_norm = (self.df['Close'] - self.close_norm_mean) / self.close_norm_std
+            roll_mean = self.df['Close'].rolling(20, min_periods=1).mean()
+            roll_std  = self.df['Close'].rolling(20, min_periods=1).std().fillna(1.0)
+            roll_std  = roll_std.replace(0, 1.0)
+            close_norm = (self.df['Close'] - roll_mean) / roll_std
+        # Store sentinel values so load_models can detect the rolling-z approach
+        self.close_norm_mean = None  # rolling z-score: no fixed mean stored
+        self.close_norm_std  = None
 
+        # Use bounded/stationary features only — VIX and raw MACD_hist are unbounded
+        # and cause out-of-distribution z-scores after StandardScaler.
+        # price_vs_ema200 is a % deviation (bounded), RSI is 0-100 (stable),
+        # volume_ratio is normalized already. XGBoost captures VIX and macro signals.
         seq_feature_cols = ['volume_ratio', 'RSI_14', 'MACD_hist',
-                            'momentum_acceleration', 'hist_volatility_20', 'above_200ema']
-        optional_cols = [c for c in ['VIX'] if c in self.df.columns]
+                            'momentum_acceleration', 'hist_volatility_20',
+                            'above_200ema', 'price_vs_ema200']
+        optional_cols = []   # VIX removed: unbounded, causes OOD saturation in MLP
         self._seq_feature_cols = seq_feature_cols
         self._seq_optional_cols = optional_cols
 
-        raw = pd.concat([
-            close_norm.rename('close_norm'),
-            self.df[seq_feature_cols + optional_cols].fillna(0)
-        ], axis=1).values.astype('float32')
+        feat_df = self.df[seq_feature_cols + optional_cols].fillna(0)
+        raw = pd.concat([close_norm.rename('close_norm'), feat_df], axis=1).values.astype('float32')
+
+        # Winsorize each feature column to [p1, p99] to prevent extreme values from
+        # causing out-of-distribution z-scores after StandardScaler. Store the bounds
+        # so predict() can apply the identical clipping at inference time.
+        self._seq_winsor_bounds = {}
+        for j in range(raw.shape[1]):
+            p1, p99 = np.percentile(raw[:, j], [1, 99])
+            self._seq_winsor_bounds[j] = (float(p1), float(p99))
+            raw[:, j] = np.clip(raw[:, j], p1, p99)
 
         n_features = raw.shape[1]
         max_idx = len(raw) - 3  # leave room for target at the tail
@@ -247,11 +278,13 @@ class ModelManager:
         # Sequence model — build one window from the tail of the data
         seq_prob = 0.5  # fallback if model unavailable
         if self.seq_model is not None and len(df) >= self.window_size:
-            # Reuse the exact normalization stats from training — critical for correct output
-            if self.close_norm_mean is not None and self.close_norm_std is not None:
-                close_norm = (df['Close'] - self.close_norm_mean) / self.close_norm_std
-            else:
-                close_norm = (df['Close'] - df['Close'].mean()) / df['Close'].std()
+            # Compute rolling 20-day z-score for the entire df so the tail window
+            # (last `window_size` rows) has already-contextualized values.
+            # This matches _build_sequences() exactly: stationary, no drift problem.
+            roll_mean = df['Close'].rolling(20, min_periods=1).mean()
+            roll_std  = df['Close'].rolling(20, min_periods=1).std().fillna(1.0)
+            roll_std  = roll_std.replace(0, 1.0)
+            close_norm = (df['Close'] - roll_mean) / roll_std
 
             seq_cols = (self._seq_feature_cols or []) + (self._seq_optional_cols or [])
             available_cols = [c for c in seq_cols if c in df.columns]
@@ -261,9 +294,35 @@ class ModelManager:
                 df[available_cols].fillna(0)
             ], axis=1).tail(self.window_size).values.astype('float32')
 
+            # Apply the same per-feature winsorization used during training
+            # to prevent OOD values from saturating the MLP after StandardScaler.
+            winsor = getattr(self, '_seq_winsor_bounds', None)
+            if winsor:
+                for j, (lo, hi) in winsor.items():
+                    if j < raw.shape[1]:
+                        raw[:, j] = np.clip(raw[:, j], lo, hi)
+
             window_flat = raw.flatten().reshape(1, -1)
             window_scaled = self.seq_scaler.transform(window_flat)
-            seq_prob = float(self.seq_model.predict_proba(window_scaled)[0][1])
+            # Final safety clip to ±3σ — catches any residual extremes
+            window_scaled = np.clip(window_scaled, -3.0, 3.0)
+            seq_prob_raw = float(self.seq_model.predict_proba(window_scaled)[0][1])
+
+            # Dampen extreme MLP outputs toward 0.5 when the model is saturating.
+            # An MLP with AUC ~0.53 (near-chance) that outputs 0.99 or 0.01 is almost
+            # certainly OOD rather than genuinely confident. We shrink extreme values
+            # back toward 0.5 proportionally, preserving directional signal while
+            # preventing it from hijacking the ensemble.
+            # Formula: prob = 0.5 + (raw - 0.5) * damping_factor
+            # damping_factor = 1.0 for raw in [0.1, 0.9], scales down toward 0.5 as extreme
+            if seq_prob_raw > 0.9:
+                dampen = 1.0 - (seq_prob_raw - 0.9) * 5.0  # 0.9→1.0, 1.0→0.5
+                seq_prob = 0.5 + (seq_prob_raw - 0.5) * max(0.2, dampen)
+            elif seq_prob_raw < 0.1:
+                dampen = 1.0 - (0.1 - seq_prob_raw) * 5.0
+                seq_prob = 0.5 + (seq_prob_raw - 0.5) * max(0.2, dampen)
+            else:
+                seq_prob = seq_prob_raw
 
         # Weighted ensemble: XGBoost 60%, sequence model 40%
         final_score = (xgb_prob * 0.6) + (seq_prob * 0.4)
@@ -296,10 +355,10 @@ class ModelManager:
             joblib.dump(self.seq_scaler, f"models/lstm/{ticker}_scaler.pkl")
             joblib.dump(
                 {
-                    'mean': self.close_norm_mean,
-                    'std': self.close_norm_std,
+                    'normalization': 'rolling_zscore',  # sentinel: rolling z-score, no fixed stats needed
                     'seq_feature_cols': self._seq_feature_cols,
                     'seq_optional_cols': self._seq_optional_cols,
+                    'seq_winsor_bounds': getattr(self, '_seq_winsor_bounds', {}),
                 },
                 f"models/lstm/{ticker}_norm_stats.pkl"
             )
@@ -320,10 +379,13 @@ class ModelManager:
             self.seq_model = joblib.load(seq_path)
             self.seq_scaler = joblib.load(f"models/lstm/{ticker}_scaler.pkl")
             norm_stats = joblib.load(f"models/lstm/{ticker}_norm_stats.pkl")
-            self.close_norm_mean = norm_stats['mean']
-            self.close_norm_std = norm_stats['std']
+            # Rolling z-score approach: no fixed mean/std needed at inference time
+            self.close_norm_mean = None
+            self.close_norm_std  = None
+            self.per_ticker_norm_stats = {}   # not used in rolling-z approach
             self._seq_feature_cols = norm_stats.get('seq_feature_cols')
             self._seq_optional_cols = norm_stats.get('seq_optional_cols')
+            self._seq_winsor_bounds = norm_stats.get('seq_winsor_bounds', {})
 
         logger.info(f"Loaded models for {ticker}")
 
@@ -347,6 +409,7 @@ if __name__ == "__main__":
     logger.info(f"Loaded {len(combined_df)} rows with {len(combined_df.columns)} features")
 
     manager = ModelManager(combined_df)
+    manager.per_ticker_norm_stats = norm_stats  # pass per-ticker stats before training
     manager.prepare_data()
     manager.train_xgboost()
     manager.train_seq_model()

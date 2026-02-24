@@ -222,19 +222,25 @@ class OptionsAnalyzer:
                 scores_df[scores_df['strike'] > best_call['strike']]
                 .sort_values('score', ascending=False)
             )
-            if not sell_candidates.empty:
-                sell_call = sell_candidates.iloc[0]
+            # Iterate sell candidates until we find one that produces a valid spread:
+            # net_debit must be positive (we pay a debit) AND less than spread_width
+            # (otherwise max_gain would be zero or negative — not a tradeable spread).
+            for _, sell_call in sell_candidates.iterrows():
                 net_debit = round(best_call['premium'] - sell_call['premium'], 2)
-                # For a bull call spread: max gain = spread width - net debit
                 spread_width = sell_call['strike'] - best_call['strike']
-                spread = {
-                    'buy_strike': best_call['strike'],
-                    'sell_strike': sell_call['strike'],
-                    'expiration': best_call['expiration'],
-                    'net_debit': net_debit,
-                    'max_gain': round(spread_width - net_debit, 2),
-                    'max_loss': net_debit   # max loss on a debit spread = net debit paid
-                }
+                max_gain = round(spread_width - net_debit, 2)
+                if net_debit > 0 and max_gain > 0:
+                    spread = {
+                        'buy_strike': best_call['strike'],
+                        'sell_strike': sell_call['strike'],
+                        'expiration': best_call['expiration'],
+                        'net_debit': net_debit,
+                        'spread_width': round(spread_width, 2),
+                        'max_gain': max_gain,
+                        'max_loss': net_debit,   # max loss on a debit spread = net debit paid
+                        'reward_risk': round(max_gain / net_debit, 2)
+                    }
+                    break  # found a valid spread — stop searching
 
         iv_analysis = self.assess_iv_crush_risk(days_to_earnings)
 
@@ -286,6 +292,9 @@ if __name__ == "__main__":
     if result.get('best_spread'):
         spread = result['best_spread']
         logger.info(f"\nBest Spread:")
-        logger.info(f"  Buy ${spread['buy_strike']} / Sell ${spread['sell_strike']}")
+        logger.info(f"  Buy ${spread['buy_strike']} / Sell ${spread['sell_strike']} (width: ${spread.get('spread_width', 'N/A')})")
         logger.info(f"  Net Debit: ${spread['net_debit']:.2f}")
         logger.info(f"  Max Gain: ${spread['max_gain']:.2f} | Max Loss: ${spread['max_loss']:.2f}")
+        logger.info(f"  Reward/Risk: {spread.get('reward_risk', 'N/A')}x")
+    else:
+        logger.info(f"\nNo valid spread found (all candidates had negative max_gain)")
