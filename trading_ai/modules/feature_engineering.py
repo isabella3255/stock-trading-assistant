@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 class FeatureEngineer:
     """Compute technical features from price data"""
     
-    def __init__(self, df: pd.DataFrame):
+    def __init__(self, df: pd.DataFrame, config: dict = None):
         self.df = df.copy()
+        self.config = config or {}
         
     def add_price_trend_features(self):
         """EMAs, SMAs, price distances, crossovers"""
@@ -171,24 +172,50 @@ class FeatureEngineer:
     def add_target_variables(self, horizon: int = 5):
         """Target for ML: price up/down in N days"""
         close = self.df['Close']
+        threshold_pct = self.config.get('prediction_threshold_pct', 2.0)
+        use_volatility_adjusted = self.config.get('use_volatility_adjusted_target', True)
+        transaction_cost_pct = self.config.get('transaction_cost_round_trip_pct', 0.2)
 
         future_price = close.shift(-horizon)
         pct_change = (future_price - close) / close * 100
+        
+        # Subtract transaction costs from returns to model realistic profitability
+        net_pct_change = pct_change - transaction_cost_pct
 
         # Binary target: 1 if price goes up at all (noisy — used for reference)
         self.df['target_5d'] = (future_price > close).astype(int)
 
-        # Magnitude target: % change
+        # Magnitude target: % change (gross, before costs)
         self.df['target_magnitude'] = pct_change
+        
+        # Net magnitude target: after transaction costs
+        self.df['target_magnitude_net'] = net_pct_change
 
-        # Filtered target: only label clear directional moves (≥ ±0.5%).
-        # Rows within ±0.5% are NaN — these ambiguous "noise" rows are excluded
-        # during training so the model learns from cleaner signal.
-        # ML training uses this column; target_5d is kept for legacy/analysis.
+        # Determine threshold: either fixed or volatility-adjusted
+        if use_volatility_adjusted and 'ATR' in self.df.columns:
+            # Volatility-adjusted: use 1.5x ATR as the threshold
+            # ATR is in price points, convert to percentage
+            atr_pct = (self.df['ATR'] / close) * 100
+            dynamic_threshold = 1.5 * atr_pct
+            # Ensure minimum threshold of threshold_pct (default 2%)
+            threshold = np.maximum(dynamic_threshold, threshold_pct)
+        else:
+            # Fixed threshold (default 2%)
+            threshold = threshold_pct
+
+        # Filtered target: only label clear directional moves above threshold
+        # This ensures the model learns from moves large enough to be profitable after costs
+        # Rows below threshold are NaN and excluded during training
         self.df['target_5d_filtered'] = np.where(
-            pct_change > 0.5, 1.0,
-            np.where(pct_change < -0.5, 0.0, np.nan)
+            net_pct_change > threshold, 1.0,
+            np.where(net_pct_change < -threshold, 0.0, np.nan)
         )
+        
+        # Store threshold for analysis
+        if isinstance(threshold, (int, float)):
+            self.df['target_threshold'] = threshold
+        else:
+            self.df['target_threshold'] = threshold
         
     def compute_all_features(self) -> pd.DataFrame:
         """Run all feature computations"""
@@ -224,8 +251,8 @@ class FeatureEngineer:
             'PE_RATIO', 'PEG_RATIO', 'PROFIT_MARGIN',
             'REVENUE_GROWTH_YOY', 'EARNINGS_SURPRISE_PCT',
             'DEBT_TO_EQUITY', 'FCF_YIELD',
-            # Finnhub sentiment
-            'NEWS_SENTIMENT',
+            # Finnhub sentiment time-series
+            'NEWS_SENTIMENT', 'SENTIMENT_MOMENTUM_7D',
             # Earnings proximity (new)
             'days_to_earnings',
         ]
@@ -244,12 +271,16 @@ class FeatureEngineer:
 
 if __name__ == "__main__":
     # Test with NVDA data
+    import yaml
     logging.basicConfig(level=logging.INFO)
     
     df = pd.read_parquet("data/processed/NVDA.parquet")
     logger.info(f"Loaded {len(df)} rows")
     
-    engineer = FeatureEngineer(df)
+    with open('../config/config.yaml', 'r') as f:
+        config = yaml.safe_load(f)
+    
+    engineer = FeatureEngineer(df, config)
     df_featured = engineer.compute_all_features()
     
     # Save it

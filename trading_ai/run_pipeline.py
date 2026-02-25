@@ -30,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def run_for_ticker(ticker: str, pipeline: DataPipeline) -> bool:
+def run_for_ticker(ticker: str, pipeline: DataPipeline, config: dict) -> bool:
     """Run data pipeline + feature engineering for one ticker. Returns True on success."""
     try:
         logger.info(f"{'='*60}")
@@ -39,7 +39,7 @@ def run_for_ticker(ticker: str, pipeline: DataPipeline) -> bool:
         df = pipeline.process_ticker(ticker)
 
         logger.info(f"  {ticker}: feature engineering")
-        engineer = FeatureEngineer(df)
+        engineer = FeatureEngineer(df, config)
         df_featured = engineer.compute_all_features()
 
         out_path = f"data/processed/{ticker}_featured.parquet"
@@ -77,7 +77,7 @@ def main():
             results['skipped'].append(ticker)
             continue
 
-        ok = run_for_ticker(ticker, pipeline)
+        ok = run_for_ticker(ticker, pipeline, config)
         if ok:
             results['success'].append(ticker)
         else:

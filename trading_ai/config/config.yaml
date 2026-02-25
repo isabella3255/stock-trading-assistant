@@ -25,6 +25,9 @@ watchlist:
 - SCCO
 - TGB
 prediction_horizon_days: 5
+prediction_threshold_pct: 2.0
+use_volatility_adjusted_target: true
+transaction_cost_round_trip_pct: 0.2
 confidence_threshold: 0.65
 ensemble_weights:
   xgboost: 0.6

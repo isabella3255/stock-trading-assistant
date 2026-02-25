@@ -61,7 +61,7 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
             headlines = []
 
         # Phase 3: Feature Engineering
-        engineer = FeatureEngineer(df)
+        engineer = FeatureEngineer(df, config)
         df_featured = engineer.compute_all_features()
         df_featured.to_parquet(f"data/processed/{ticker}_featured.parquet")
 
