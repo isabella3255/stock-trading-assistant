@@ -1,16 +1,61 @@
 """
 Options Analyzer Module
 
-Scores options setups and assesses IV crush risk.
+Scores options setups, assesses IV crush risk, and calculates theoretical prices
+using Black-Scholes when yfinance data is unavailable.
 """
 
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime, timezone
+from scipy.stats import norm
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def black_scholes_call(S: float, K: float, T: float, r: float, sigma: float) -> dict:
+    """
+    Calculate Black-Scholes call option price and Greeks.
+    
+    Args:
+        S: Current stock price
+        K: Strike price
+        T: Time to expiration (years)
+        r: Risk-free rate (annual, as decimal, e.g. 0.05 for 5%)
+        sigma: Implied volatility (annual, as decimal, e.g. 0.30 for 30%)
+    
+    Returns:
+        dict with 'price', 'delta', 'gamma', 'theta', 'vega'
+    """
+    if T <= 0:
+        # Option expired
+        return {
+            'price': max(0, S - K),
+            'delta': 1.0 if S > K else 0.0,
+            'gamma': 0.0,
+            'theta': 0.0,
+            'vega': 0.0
+        }
+    
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    
+    call_price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    delta = norm.cdf(d1)
+    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+    theta = (-(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) 
+             - r * K * np.exp(-r * T) * norm.cdf(d2)) / 365  # Daily theta
+    vega = S * norm.pdf(d1) * np.sqrt(T) / 100  # Vega per 1% IV change
+    
+    return {
+        'price': round(call_price, 2),
+        'delta': round(delta, 4),
+        'gamma': round(gamma, 6),
+        'theta': round(theta, 4),
+        'vega': round(vega, 4),
+    }
 
 
 class OptionsAnalyzer:
@@ -48,19 +93,52 @@ class OptionsAnalyzer:
         now = datetime.now(timezone.utc)
         return max(0, (exp_date - now).days)
 
-    def _get_premium(self, row) -> float:
+    def _get_premium(self, row, use_ask_for_buy: bool = True) -> float:
         """
         Extract option premium from a chain row.
-        yfinance may use 'lastPrice', and it falls back to the bid/ask midpoint
-        when lastPrice is zero (stale or illiquid option).
+        
+        For realistic execution:
+          - Use ASK price when buying (you pay the ask)
+          - Use BID price when selling (you receive the bid)
+        
+        Falls back to lastPrice if bid/ask is unavailable, then Black-Scholes
+        if all market data is stale.
+        
+        Args:
+            row: Options chain row with price data
+            use_ask_for_buy: If True, prefer ask price (realistic buy price)
         """
-        last = row.get('lastPrice', 0) or 0
-        if last > 0:
-            return last
         bid = row.get('bid', 0) or 0
         ask = row.get('ask', 0) or 0
+        last = row.get('lastPrice', 0) or 0
+        
+        # Prefer ask price for buys (realistic execution)
+        if use_ask_for_buy and ask > 0:
+            return ask
+        
+        # Fall back to bid-ask midpoint if available
         if bid > 0 and ask > 0:
             return (bid + ask) / 2
+        
+        # Fall back to last traded price
+        if last > 0:
+            return last
+        
+        # Final fallback: Black-Scholes theoretical price
+        iv = row.get('impliedVolatility', 0) or 0
+        if iv > 0:
+            dte = self.calculate_dte(row['expiration'])
+            T = dte / 365.0
+            if T > 0:
+                bs = black_scholes_call(
+                    S=self.current_price,
+                    K=row['strike'],
+                    T=T,
+                    r=0.05,  # Assume 5% risk-free rate
+                    sigma=iv
+                )
+                return bs['price']
+        
         return 0
 
     def score_option(self, row, dte_min=14, dte_max=45) -> tuple:
@@ -171,13 +249,13 @@ class OptionsAnalyzer:
         }
 
     def analyze(self, signal: str, days_to_earnings=None, signal_score: float = 0.5) -> dict:
-        """Main analysis — returns scored call recommendations, spread setup, and Kelly sizing.
+        """Main analysis — returns scored call recommendations, spread setup, and fixed risk sizing.
 
         Args:
             signal: 'BULL' or 'STRONG_BULL'
             days_to_earnings: days until next earnings (optional)
-            signal_score: ensemble final_score from ml_result (0–1). Used to size positions
-                          via half-Kelly criterion. Default 0.5 = no edge.
+            signal_score: ensemble final_score from ml_result (0–1). Used to adjust
+                          position sizing conservatively. Default 0.5 = baseline risk.
         """
 
         if signal not in ['BULL', 'STRONG_BULL']:
@@ -251,26 +329,39 @@ class OptionsAnalyzer:
 
         iv_analysis = self.assess_iv_crush_risk(days_to_earnings)
 
-        # ── Half-Kelly position sizing ────────────────────────────────────────
-        # Kelly formula for binary bets: f* = (p*(b+1) - 1) / b
-        # where p = win probability (signal_score), b = reward/risk ratio
-        # We use half-Kelly (f*/2) for safety — standard practice in trading.
-        # Capped at 5% of portfolio to prevent extreme concentration.
-        reward_risk = (spread['reward_risk'] if spread else 1.0)
-        p_win = max(0.5, min(0.95, signal_score))   # clamp: never below chance, never certain
-        b = max(0.5, reward_risk)                   # clamp: at least 0.5:1 R/R
-        kelly_full = (p_win * (b + 1) - 1) / b
-        kelly_half = max(0.0, kelly_full / 2)       # half-Kelly, floor at 0
-        suggested_risk_pct = round(min(5.0, kelly_half * 100), 1)
+        # ── Fixed Risk Position Sizing ─────────────────────────────────────────
+        # Professional traders use fixed risk (1-2% of account per trade), NOT Kelly.
+        # Kelly criterion over-leverages when using uncalibrated ML probabilities.
+        # 
+        # Sizing logic:
+        #   - STRONG_BULL (score > 0.72): 2.0% risk
+        #   - BULL (score > 0.62):         1.5% risk  
+        #   - Otherwise:                   1.0% risk (baseline)
+        # 
+        # For options: Cap at 2% of account (options are already leveraged)
+        # For stock: Use stop loss to calculate position size
+        if signal == 'STRONG_BULL':
+            base_risk_pct = 2.0
+        elif signal == 'BULL':
+            base_risk_pct = 1.5
+        else:
+            base_risk_pct = 1.0
+        
+        # Adjust down for low confidence scores
+        confidence_multiplier = min(1.0, signal_score / 0.6)  # Scale down if score < 0.6
+        suggested_risk_pct = round(base_risk_pct * confidence_multiplier, 1)
+        
+        # Cap at 2% for options (they're already leveraged)
+        suggested_risk_pct = min(2.0, suggested_risk_pct)
 
         position_sizing = {
             'suggested_risk_pct_of_portfolio': suggested_risk_pct,
-            'kelly_full': round(kelly_full, 3),
-            'kelly_half': round(kelly_half, 3),
+            'risk_method': 'fixed_risk',
+            'signal_strength': signal,
+            'confidence_score': round(signal_score, 3),
             'rationale': (
-                f"Half-Kelly: p_win={p_win:.0%}, R/R={b:.1f}:1 → "
-                f"full Kelly={kelly_full*100:.1f}%, half Kelly={kelly_half*100:.1f}% → "
-                f"capped at {suggested_risk_pct}% of portfolio"
+                f"Fixed Risk Sizing: {signal} signal with {signal_score:.0%} confidence → "
+                f"{suggested_risk_pct}% of portfolio (conservative, capped at 2% for options)"
             ),
         }
 

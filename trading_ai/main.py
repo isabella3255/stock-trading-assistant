@@ -181,6 +181,30 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
         # Flatten LLM result — recommendation text is already saved to .txt and .json cache;
         # store only the first 500 chars of the verdict in the CSV for dashboard display.
         llm_verdict = (llm_result.get('recommendation', '') or '')[:500] if llm_result else ''
+        
+        # ── Log prediction for forward validation ─────────────────────────────
+        # Track all predictions so we can validate accuracy over time (real win rate)
+        try:
+            from modules.prediction_tracker import PredictionTracker
+            tracker = PredictionTracker()
+            tracker.log_prediction(
+                ticker=ticker,
+                signal=ml_result['signal'],
+                final_score=ml_result['final_score'],
+                xgb_prob=ml_result['xgb_prob'],
+                seq_prob=ml_result['lstm_prob'],
+                entry_price=current_price,
+                hist_vol=hist_vol,
+                rsi=float(latest.get('RSI_14', 0)) if 'RSI_14' in latest else None,
+                vix=macro.get('vix'),
+                vix_3m=macro.get('vix_3m'),
+                vix_term_slope=macro.get('vix_term_slope'),
+                days_to_earnings=int(days_to_earnings) if days_to_earnings else None,
+                iv_crush_risk=options_result.get('iv_analysis', {}).get('risk') if options_result else None,
+                fear_greed_index=macro.get('fear_greed_index'),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to log prediction for tracking: {e}")
 
         return {
             'ticker':       ticker,

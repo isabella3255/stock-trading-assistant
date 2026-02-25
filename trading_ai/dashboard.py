@@ -201,6 +201,27 @@ with st.sidebar:
     ticker = st.selectbox("🔍 Select Ticker", all_tickers, index=0)
 
     st.markdown("---")
+    
+    # ── Account Size for Position Sizing ─────────────────────────────────
+    st.markdown("### 💰 Account Settings")
+    account_size = st.number_input(
+        "Account Size ($)",
+        min_value=1000,
+        max_value=10000000,
+        value=10000,
+        step=1000,
+        help="Your total trading account size for position sizing calculations"
+    )
+    risk_per_trade = st.slider(
+        "Risk Per Trade (%)",
+        min_value=0.5,
+        max_value=5.0,
+        value=1.5,
+        step=0.5,
+        help="Maximum % of account to risk on a single trade (1-2% is conservative)"
+    )
+    
+    st.markdown("---")
     st.markdown("### ⚡ Quick Actions")
 
     # ── Per-ticker actions ─────────────────────────────────────────────────
@@ -232,6 +253,53 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**All Watchlist Tickers**")
+    
+    if st.button("🔄 DAILY REFRESH (Full Pipeline)", key="daily_refresh", use_container_width=True,
+                 type="primary",
+                 help="Complete workflow: Pull data → Retrain model → Generate signals with LLM"):
+        with st.spinner("Running full pipeline..."):
+            # Step 1: Pull all data
+            st.info("Step 1/3: Pulling fresh data...")
+            result1 = subprocess.run(
+                [sys.executable, "run_pipeline.py"],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True
+            )
+            if result1.returncode != 0:
+                st.error(f"Data pull failed: {result1.stderr[:500]}")
+            else:
+                st.success("✓ Data pulled")
+            
+            # Step 2: Retrain model
+            st.info("Step 2/3: Retraining model...")
+            result2 = subprocess.run(
+                [sys.executable, "-m", "modules.ml_models"],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True
+            )
+            if result2.returncode != 0:
+                st.error(f"Model training failed: {result2.stderr[:500]}")
+            else:
+                st.success("✓ Model retrained")
+            
+            # Step 3: Generate signals
+            st.info("Step 3/3: Generating AI recommendations...")
+            result3 = subprocess.run(
+                [sys.executable, "main.py"],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True
+            )
+            if result3.returncode != 0:
+                st.error(f"Signal generation failed: {result3.stderr[:500]}")
+            else:
+                st.success("✅ Daily refresh complete!")
+                st.info(f"Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M ET')}")
+                st.rerun()
+    
+    st.markdown("---")
 
     if st.button("📥 Pull All Data", key="pull_all_data", use_container_width=True,
                  help="Runs run_pipeline.py for every ticker in your watchlist"):
@@ -308,6 +376,8 @@ tabs = st.tabs([
     "🧠 ML Signals",
     "🎯 Options",
     "🤖 AI Recommendation",
+    "📊 Performance & Backtest",
+    "📈 Live Track Record",
     "⚡ Feature Importance",
     "📋 All Tickers",
     "⚙️ Manage Watchlist",
@@ -650,6 +720,59 @@ with tabs[3]:
                             st.info("No valid bull call spread found (all candidates had negative max gain).")
 
                         st.markdown("---")
+                        
+                        # ── Position Sizing Calculator ─────────────────────────────
+                        st.markdown("#### 💰 Position Sizing (Based on Your Account)")
+                        
+                        max_risk_dollars = account_size * (risk_per_trade / 100)
+                        st.info(f"**Risk Budget:** ${max_risk_dollars:,.0f} ({risk_per_trade}% of ${account_size:,.0f})")
+                        
+                        # For options: recommend 2% max position size
+                        max_position_size = account_size * 0.02
+                        
+                        # Calculate number of contracts based on top call
+                        if top_calls:
+                            best_call = top_calls[0]
+                            premium = best_call.get('premium', 0)
+                            contracts_per_lot = 100  # Standard option contract
+                            
+                            if premium > 0:
+                                # Max contracts based on 2% position size rule
+                                max_contracts = int(max_position_size / (premium * contracts_per_lot))
+                                total_cost = max_contracts * premium * contracts_per_lot
+                                pct_of_account = (total_cost / account_size) * 100
+                                
+                                st.success(f"""
+**Recommended Position:**
+- **Buy {max_contracts} contract(s)** of ${best_call['strike']} call expiring {best_call['expiration']}
+- **Cost:** ${total_cost:,.0f} ({pct_of_account:.1f}% of account)
+- **Premium per contract:** ${premium:.2f} × 100 shares = ${premium * contracts_per_lot:,.0f}
+- **Breakeven:** ${best_call.get('breakeven', 0):.2f} (stock must be above this at expiry)
+                                """)
+                                
+                                st.warning("""
+**Risk Management:**
+- This position risks ${total_cost:,.0f} (max loss if worthless at expiry)
+- Set stop loss at 50% premium loss: Exit if option drops to ${(premium * 0.5):.2f}
+- Take profits at 100% gain: Exit if option doubles to ${(premium * 2):.2f}
+                                """.replace("${total_cost:,.0f}", f"${total_cost:,.0f}").replace("${(premium * 0.5):.2f}", f"${(premium * 0.5):.2f}").replace("${(premium * 2):.2f}", f"${(premium * 2):.2f}"))
+                        
+                        # For spread
+                        if spread:
+                            net_debit = spread.get('net_debit', 0)
+                            if net_debit > 0:
+                                spread_contracts = int(max_position_size / (net_debit * 100))
+                                spread_cost = spread_contracts * net_debit * 100
+                                spread_pct = (spread_cost / account_size) * 100
+                                
+                                st.info(f"""
+**Alternative: Bull Call Spread**
+- **Buy {spread_contracts} spread(s)**: Buy ${spread['buy_strike']}, Sell ${spread['sell_strike']}
+- **Cost:** ${spread_cost:,.0f} ({spread_pct:.1f}% of account)
+- **Max Gain:** ${spread_contracts * spread.get('max_gain', 0):,.0f}
+- **Risk/Reward:** {spread.get('reward_risk', 0):.2f}x
+                                """)
+                        
                         st.metric("Recommendation", result.get("recommendation", "N/A"))
 
                 except Exception as e:
@@ -682,12 +805,333 @@ with tabs[4]:
             with open(old_files[-1]) as f:
                 old = json.load(f)
             st.markdown(old.get("recommendation", ""))
+    
+    # ── Chat Interface for Follow-up Questions ────────────────────────────
+    st.markdown("---")
+    st.subheader("💬 Ask Follow-up Questions")
+    
+    # Initialize chat history in session state
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    
+    # Display chat messages
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("Ask a follow-up question about this recommendation..."):
+        # Add user message to chat history
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        
+        # Display user message
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Get AI response
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    from anthropic import Anthropic
+                    client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+                    
+                    # Build context with current recommendation
+                    context = f"""You are a professional trading assistant. The user is viewing a trading recommendation for {ticker}.
+                    
+Current Recommendation:
+{llm.get("recommendation", "No recommendation available") if llm else "No recommendation generated yet"}
+
+Current Signal: {ticker_sig.get('signal', 'N/A')}
+ML Score: {ticker_sig.get('score', 0):.3f}
+
+Answer the user's follow-up question based on this context. Be concise and actionable."""
+                    
+                    # Create message history for Claude
+                    messages = [{"role": "user", "content": context}]
+                    for msg in st.session_state.chat_history[-10:]:  # Last 10 messages
+                        messages.append({"role": msg["role"], "content": msg["content"]})
+                    
+                    response = client.messages.create(
+                        model="claude-3-5-sonnet-20241022",
+                        max_tokens=1000,
+                        messages=messages
+                    )
+                    
+                    assistant_message = response.content[0].text
+                    st.markdown(assistant_message)
+                    
+                    # Add to chat history
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": assistant_message
+                    })
+                    
+                except Exception as e:
+                    st.error(f"Chat failed: {e}")
+                    st.info("Make sure ANTHROPIC_API_KEY is set in your .env file")
 
 
 # ---------------------------------------------------------------
-# TAB 6: FEATURE IMPORTANCE
+# TAB 6: PERFORMANCE & BACKTEST
 # ---------------------------------------------------------------
 with tabs[5]:
+    st.subheader("📊 Performance & Backtest Results")
+    
+    # Check if backtest results exist
+    backtest_summary_path = f"outputs/backtests/{ticker}_summary.csv"
+    backtest_trades_path = f"outputs/backtests/{ticker}_trades.csv"
+    
+    if not os.path.exists(backtest_summary_path):
+        st.info(f"No backtest results available for {ticker}")
+        st.markdown("""
+        **To generate backtest results:**
+        ```bash
+        cd trading_ai
+        source ../.venv/bin/activate
+        python -m modules.backtester
+        ```
+        
+        This will run walk-forward validation on historical data and generate:
+        - Win rate
+        - Sharpe ratio
+        - Max drawdown
+        - Profit factor
+        - Trade-level analysis
+        """)
+    else:
+        # Load backtest summary
+        summary = pd.read_csv(backtest_summary_path).iloc[0].to_dict()
+        
+        # Display key metrics in columns
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Total Trades", f"{summary.get('total_trades', 0):.0f}")
+            st.metric("Win Rate", f"{summary.get('win_rate', 0):.1f}%")
+        
+        with col2:
+            st.metric("Avg Return", f"{summary.get('avg_return', 0):.2f}%")
+            st.metric("Total Return", f"{summary.get('total_return', 0):.2f}%")
+        
+        with col3:
+            st.metric("Sharpe Ratio", f"{summary.get('sharpe_ratio', 0):.2f}")
+            st.metric("Max Drawdown", f"{summary.get('max_drawdown', 0):.2f}%")
+        
+        with col4:
+            st.metric("Profit Factor", f"{summary.get('profit_factor', 0):.2f}")
+            st.metric("Calmar Ratio", f"{summary.get('calmar_ratio', 0):.2f}")
+        
+        st.markdown("---")
+        
+        # Load and display trade history
+        if os.path.exists(backtest_trades_path):
+            trades = pd.read_csv(backtest_trades_path)
+            
+            st.subheader("Trade History")
+            
+            # Create equity curve
+            trades['cumulative_return'] = (1 + trades['net_return_pct']/100).cumprod() - 1
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=trades['date'],
+                y=trades['cumulative_return'] * 100,
+                mode='lines',
+                name='Equity Curve',
+                line=dict(color='green' if trades['cumulative_return'].iloc[-1] > 0 else 'red', width=2)
+            ))
+            fig.update_layout(
+                title="Cumulative Return Over Time",
+                xaxis_title="Date",
+                yaxis_title="Cumulative Return (%)",
+                hovermode='x unified',
+                height=400
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Trade table
+            st.subheader("Individual Trades")
+            display_trades = trades[['date', 'signal', 'final_score', 'entry_price', 
+                                     'actual_direction', 'net_return_pct', 'correct']].copy()
+            display_trades['net_return_pct'] = display_trades['net_return_pct'].round(2)
+            display_trades['final_score'] = display_trades['final_score'].round(3)
+            display_trades['entry_price'] = display_trades['entry_price'].round(2)
+            
+            st.dataframe(display_trades, use_container_width=True)
+        
+        # Performance interpretation
+        st.markdown("---")
+        st.subheader("Performance Interpretation")
+        
+        win_rate = summary.get('win_rate', 0)
+        sharpe = summary.get('sharpe_ratio', 0)
+        profit_factor = summary.get('profit_factor', 0)
+        
+        if win_rate > 55 and sharpe > 1.0 and profit_factor > 1.5:
+            st.success("✅ **Strong Performance** - System shows consistent edge")
+        elif win_rate > 45 and sharpe > 0.5 and profit_factor > 1.0:
+            st.warning("⚠️ **Modest Performance** - System has slight edge, needs refinement")
+        else:
+            st.error("🔴 **Poor Performance** - System needs improvement or more data")
+        
+        st.markdown(f"""
+        **Metrics Explained:**
+        - **Win Rate**: {win_rate:.1f}% (target: >50% for long-only strategy)
+        - **Sharpe Ratio**: {sharpe:.2f} (target: >1.0 for good risk-adjusted returns)
+        - **Profit Factor**: {profit_factor:.2f} (target: >1.5, meaning wins are 1.5x losses)
+        - **Max Drawdown**: {summary.get('max_drawdown', 0):.1f}% (max decline from peak)
+        
+        **Note**: These results are from walk-forward validation on historical data.
+        Past performance does not guarantee future results.
+        """)
+
+
+# ---------------------------------------------------------------
+# TAB 7: LIVE TRACK RECORD (Forward Validation)
+# ---------------------------------------------------------------
+with tabs[6]:
+    st.subheader("📈 Live Track Record — Real Prediction Accuracy")
+    
+    st.info("""
+    **This tracks YOUR ACTUAL predictions and outcomes over time.**
+    
+    Unlike backtesting (which uses old data), this shows:
+    - What you predicted on each date
+    - What actually happened 5 days later
+    - Your real win rate in current market conditions
+    """)
+    
+    prediction_log_path = ROOT / "outputs" / "prediction_log.csv"
+    
+    if not prediction_log_path.exists():
+        st.warning("No predictions logged yet. Predictions are automatically logged each time you run `main.py`.")
+        st.markdown("""
+        **To start tracking:**
+        1. Run daily analysis: `python main.py` or click sidebar buttons
+        2. After 5 days, validate outcomes: `python validate_predictions.py`
+        3. Come back here to see your real track record
+        
+        **Validation Schedule (Recommended):**
+        - Run `python validate_predictions.py` daily after 4 PM ET
+        - Or set up a cron job to auto-validate
+        """)
+    else:
+        # Load prediction log
+        pred_log = pd.read_csv(prediction_log_path)
+        pred_log['prediction_date'] = pd.to_datetime(pred_log['prediction_date'])
+        
+        # Overall stats
+        st.markdown("### 📊 Overall Performance")
+        
+        total_preds = len(pred_log)
+        validated = pred_log[pred_log['outcome_verified'] == True]
+        pending = total_preds - len(validated)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Predictions", total_preds)
+        col2.metric("Validated", len(validated))
+        col3.metric("Pending", pending, help="< 5 days old, waiting for outcome")
+        
+        if len(validated) > 0:
+            win_rate = (validated['prediction_correct'].sum() / len(validated)) * 100
+            col4.metric("Win Rate", f"{win_rate:.1f}%")
+            
+            st.markdown("---")
+            
+            # Performance by time period
+            st.markdown("### 📅 Performance Over Time")
+            
+            periods = {
+                "Last 7 Days": 7,
+                "Last 30 Days": 30,
+                "Last 90 Days": 90,
+                "All Time": 9999
+            }
+            
+            period_stats = []
+            for period_name, days in periods.items():
+                cutoff = datetime.now() - timedelta(days=days)
+                period_validated = validated[validated['prediction_date'] >= cutoff]
+                
+                if len(period_validated) > 0:
+                    period_win_rate = (period_validated['prediction_correct'].sum() / len(period_validated)) * 100
+                    period_avg_return = period_validated['actual_return_pct'].mean()
+                    
+                    period_stats.append({
+                        'Period': period_name,
+                        'Trades': len(period_validated),
+                        'Win Rate': f"{period_win_rate:.1f}%",
+                        'Avg Return': f"{period_avg_return:+.2f}%"
+                    })
+            
+            if period_stats:
+                st.dataframe(pd.DataFrame(period_stats), use_container_width=True, hide_index=True)
+            
+            st.markdown("---")
+            
+            # Performance by confidence level
+            st.markdown("### 🎯 Accuracy by Confidence Level")
+            
+            confidence_stats = validated.groupby('confidence_level').agg({
+                'prediction_correct': ['sum', 'count', 'mean'],
+                'actual_return_pct': 'mean'
+            }).round(2)
+            
+            if not confidence_stats.empty:
+                confidence_display = pd.DataFrame({
+                    'Confidence': confidence_stats.index,
+                    'Trades': confidence_stats[('prediction_correct', 'count')].values,
+                    'Win Rate (%)': (confidence_stats[('prediction_correct', 'mean')] * 100).round(1).values,
+                    'Avg Return (%)': confidence_stats[('actual_return_pct', 'mean')].round(2).values
+                })
+                st.dataframe(confidence_display, use_container_width=True, hide_index=True)
+                
+                st.caption("**Key Insight:** High confidence signals should have >60% win rate. If not, model is miscalibrated.")
+            
+            st.markdown("---")
+            
+            # Performance by ticker
+            st.markdown("### 📊 Performance by Ticker")
+            
+            ticker_stats = validated.groupby('ticker').agg({
+                'prediction_correct': ['sum', 'count', 'mean'],
+                'actual_return_pct': 'mean'
+            }).round(2)
+            
+            if not ticker_stats.empty:
+                ticker_display = pd.DataFrame({
+                    'Ticker': ticker_stats.index,
+                    'Trades': ticker_stats[('prediction_correct', 'count')].values,
+                    'Win Rate (%)': (ticker_stats[('prediction_correct', 'mean')] * 100).round(1).values,
+                    'Avg Return (%)': ticker_stats[('actual_return_pct', 'mean')].round(2).values
+                })
+                # Sort by win rate descending
+                ticker_display = ticker_display.sort_values('Win Rate (%)', ascending=False)
+                st.dataframe(ticker_display, use_container_width=True, hide_index=True)
+                
+                st.caption("**Key Insight:** Focus on tickers where model consistently outperforms. Avoid tickers with <45% win rate.")
+            
+            st.markdown("---")
+            
+            # Recent predictions (last 10)
+            st.markdown("### 📋 Recent Predictions")
+            recent = pred_log.nlargest(10, 'prediction_date')
+            display_recent = recent[['prediction_date', 'ticker', 'signal', 'final_score', 
+                                     'entry_price', 'outcome_verified', 'actual_return_pct', 'prediction_correct']].copy()
+            display_recent['final_score'] = display_recent['final_score'].round(3)
+            display_recent['entry_price'] = display_recent['entry_price'].round(2)
+            display_recent['actual_return_pct'] = display_recent['actual_return_pct'].fillna(0).round(2)
+            st.dataframe(display_recent, use_container_width=True, hide_index=True)
+            
+            st.caption("**Note:** Predictions <5 days old show 'outcome_verified = False' (still pending)")
+        else:
+            st.info("Predictions logged, but no outcomes validated yet (need 5+ days). Run `python validate_predictions.py`")
+
+
+# ---------------------------------------------------------------
+# TAB 8: FEATURE IMPORTANCE
+# ---------------------------------------------------------------
+with tabs[7]:
     st.subheader("Feature Importance — XGBoost")
 
     imp = load_feature_importance(ticker)
@@ -750,9 +1194,9 @@ with tabs[5]:
 
 
 # ---------------------------------------------------------------
-# TAB 7: ALL TICKERS
+# TAB 9: ALL TICKERS
 # ---------------------------------------------------------------
-with tabs[6]:
+with tabs[8]:
     st.subheader("All Tickers — Signal Summary")
 
     report = load_report()
@@ -811,9 +1255,9 @@ with tabs[6]:
 
 
 # ---------------------------------------------------------------
-# TAB 8: MANAGE WATCHLIST
+# TAB 10: MANAGE WATCHLIST
 # ---------------------------------------------------------------
-with tabs[7]:
+with tabs[9]:
     st.subheader("⚙️ Manage Watchlist")
     st.markdown(
         "Add or remove tickers from your watchlist. Changes are written to "
