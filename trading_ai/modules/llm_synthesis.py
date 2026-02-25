@@ -91,6 +91,9 @@ Historical Volatility (20d): {technical.get('hist_vol_20', 0):.1%}
 
 === MACRO REGIME ===
 VIX (Fear Index): {vix:.1f} — {vix_label}
+VIX 3-Month: {macro.get('vix_3m', 0):.1f}
+VIX Term Structure (30D - 3M): {macro.get('vix_term_slope', 0):+.2f} ({'inverted = fear spike' if macro.get('vix_term_slope', 0) > 2 else 'normal contango' if macro.get('vix_term_slope', 0) < -2 else 'flat'})
+CNN Fear & Greed Index: {macro.get('fear_greed_index', 50):.0f}/100 ({'Extreme Fear' if macro.get('fear_greed_index', 50) < 25 else 'Fear' if macro.get('fear_greed_index', 50) < 45 else 'Neutral' if macro.get('fear_greed_index', 50) < 55 else 'Greed' if macro.get('fear_greed_index', 50) < 75 else 'Extreme Greed'})
 Fed Funds Rate: {macro.get('fed_rate', 0):.2f}%
 10Y Treasury Yield: {macro.get('treasury_10y', 0):.2f}%
 2Y Treasury Yield: {macro.get('treasury_2y', 0):.2f}%
@@ -102,8 +105,13 @@ Unemployment Rate: {macro.get('unemployment', 0):.1f}%
 P/E Ratio: {f"{fundamentals.get('pe_ratio'):.1f}" if fundamentals.get('pe_ratio') else 'N/A'}
 PEG Ratio: {f"{fundamentals.get('peg_ratio'):.2f}" if fundamentals.get('peg_ratio') else 'N/A'}
 Profit Margin: {f"{fundamentals.get('profit_margin'):.1%}" if fundamentals.get('profit_margin') else 'N/A'}
+Revenue Growth YoY: {f"{fundamentals.get('revenue_growth_yoy'):+.1%}" if fundamentals.get('revenue_growth_yoy') is not None else 'N/A'}
+Earnings Surprise (last quarter): {f"{fundamentals.get('earnings_surprise_pct'):+.1%}" if fundamentals.get('earnings_surprise_pct') is not None else 'N/A'}
+Debt/Equity: {f"{fundamentals.get('debt_to_equity'):.2f}" if fundamentals.get('debt_to_equity') else 'N/A'}
+FCF Yield: {f"{fundamentals.get('fcf_yield'):.2%}" if fundamentals.get('fcf_yield') else 'N/A'}
 
 === NEWS SENTIMENT ===
+Finnhub Sentiment Score: {data.get('finnhub_sentiment', 0):+.2f} (range -1 to +1; positive = more bullish coverage)
 Recent Headlines: {', '.join(headlines[:5]) if headlines else 'No headlines available'}
 
 === OPTIONS ANALYSIS ===

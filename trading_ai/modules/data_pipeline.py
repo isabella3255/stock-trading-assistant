@@ -1,13 +1,15 @@
 """
 Data Pipeline Module
 
-Loads and merges data from 6 sources:
-1. Kaggle - Historical OHLCV (20+ years)
-2. yfinance - Recent data + options chains
-3. FRED - Macro indicators
-4. Alpha Vantage - Fundamentals
-5. Finnhub - Sentiment & insider trading
-6. NewsAPI - Headlines
+Loads and merges data from 5 sources:
+1. yfinance - Recent data + options chains + earnings dates
+2. FRED - Macro indicators (VIX, Fed Rate, Treasury yields, CPI, Unemployment,
+           plus VIX term structure: VXST/VIX9D, VXMT/VIX3M)
+3. Financial Modeling Prep (FMP) - Fundamentals (replaces Alpha Vantage)
+   Provides PE, profit margin, revenue growth YoY, earnings surprise %, debt/equity, FCF yield
+4. Finnhub - News sentiment & insider trading
+5. NewsAPI - Headlines
+Plus: CNN Fear & Greed Index (free, single HTTP call)
 """
 
 import os
@@ -36,99 +38,46 @@ logger = logging.getLogger(__name__)
 
 class DataPipeline:
     """Loads and merges data from multiple sources"""
-    
+
     def __init__(self, config_path: str = "config/config.yaml"):
         """Initialize with config"""
         import yaml
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        
+
         self.cache_dir = Path("data/cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.fred_api_key = os.getenv('FRED_API_KEY')
-        
-    def load_kaggle_data(self, ticker: str) -> pd.DataFrame:
-        """Load historical data from Kaggle CSV files"""
-        kaggle_path = self.config['data_pipeline']['kaggle_data_path']
-        
-        # Try different file formats and locations
-        possible_files = [
-            f"{kaggle_path}/Stocks/{ticker.lower()}.us.txt",
-            f"{kaggle_path}/Stocks/{ticker.upper()}.us.txt",
-            f"{kaggle_path}/ETFs/{ticker.lower()}.us.txt",
-            f"{kaggle_path}/ETFs/{ticker.upper()}.us.txt",
-            f"{kaggle_path}/{ticker.lower()}.us.txt",
-            f"{kaggle_path}/{ticker.upper()}.us.txt",
-        ]
-        
-        for file_path in possible_files:
-            if os.path.exists(file_path):
-                logger.info(f"Loading Kaggle data from {file_path}")
-                df = pd.read_csv(file_path)
-                df['Date'] = pd.to_datetime(df['Date'])
-                df = df.set_index('Date')
-                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-                return df
-        
-        logger.warning(f"No Kaggle file found for {ticker}")
-        return pd.DataFrame()
-    
+        self.fmp_api_key  = os.getenv('FMP_API_KEY')
+
     def load_yfinance_data(self, ticker: str) -> pd.DataFrame:
-        """Load recent data from yfinance"""
+        """Load recent data from yfinance (2 years of OHLCV)"""
         try:
             logger.info(f"Fetching yfinance data for {ticker}")
-            
             stock = yf.Ticker(ticker)
-            
-            # Get 2 years of recent data
-            period = self.config['data_pipeline']['recent_years']
+            period = self.config['data_pipeline'].get('recent_years', 2)
             df = stock.history(period=f"{period}y")
-            
             if df.empty:
                 logger.warning(f"No yfinance data for {ticker}")
                 return pd.DataFrame()
-            
-            # Standardize column names
             df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
             df.index.name = 'Date'
-            
             return df
         except Exception as e:
             logger.warning(f"yfinance failed for {ticker}: {e}")
             return pd.DataFrame()
-    
+
     def merge_price_data(self, ticker: str) -> pd.DataFrame:
-        """Merge Kaggle historical + yfinance recent data"""
-        
-        # Load both sources
-        kaggle_df = self.load_kaggle_data(ticker)
-        yfinance_df = self.load_yfinance_data(ticker)
-        
-        if kaggle_df.empty and yfinance_df.empty:
-            raise ValueError(f"No data found for {ticker}")
-
-        if kaggle_df.empty:
-            return yfinance_df
-
-        if yfinance_df.empty:
-            return kaggle_df
-
-        # Strip timezone from both before merging.
-        # Kaggle CSVs are tz-naive; yfinance returns a UTC-aware index.
-        # Concatenating mixed-tz indices silently drops or misaligns the
-        # yfinance rows, so the 2018-present data never makes it into the parquet.
-        kaggle_df.index = pd.to_datetime(kaggle_df.index).tz_localize(None)
-        yfinance_df.index = pd.to_datetime(yfinance_df.index).tz_localize(None)
-
-        # Merge: yfinance overwrites overlapping dates (keep='last')
-        combined = pd.concat([kaggle_df, yfinance_df])
-        combined = combined[~combined.index.duplicated(keep='last')]
-        combined = combined.sort_index()
-
-        logger.info(f"Merged {len(combined)} rows for {ticker} "
-                    f"({combined.index.min().date()} to {combined.index.max().date()})")
-        return combined
+        """Load yfinance price data (single source — Kaggle removed)"""
+        df = self.load_yfinance_data(ticker)
+        if df.empty:
+            raise ValueError(f"No price data found for {ticker}")
+        # Ensure tz-naive index for consistent merging with macro data
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        logger.info(f"Loaded {len(df)} rows for {ticker} "
+                    f"({df.index.min().date()} to {df.index.max().date()})")
+        return df
     
     def load_fred_macro_data(self) -> pd.DataFrame:
         """Load macro indicators from FRED"""
@@ -154,12 +103,13 @@ class DataPipeline:
             return pd.DataFrame()
 
         indicators = {
-            'VIX': 'VIXCLS',
-            'FED_RATE': 'DFF',
+            'VIX':          'VIXCLS',
+            'VIX3M':        'VXVCLS',    # CBOE 3-Month Volatility Index (VIX3M proxy)
+            'FED_RATE':     'DFF',
             'TREASURY_10Y': 'DGS10',
-            'TREASURY_2Y': 'DGS2',
-            'CPI': 'CPIAUCSL',
-            'UNEMPLOYMENT': 'UNRATE'
+            'TREASURY_2Y':  'DGS2',
+            'CPI':          'CPIAUCSL',
+            'UNEMPLOYMENT': 'UNRATE',
         }
 
         macro_data = {}
@@ -187,51 +137,137 @@ class DataPipeline:
         
         if not macro_data:
             return pd.DataFrame()
-        
+
         df = pd.DataFrame(macro_data)
-        
+
+        # Compute VIX term structure slope: VIX (30-day) - VIX3M (90-day)
+        # Negative = normal contango (calm — near-term vol < long-term), Positive = inverted (fear spike)
+        if 'VIX' in df.columns and 'VIX3M' in df.columns:
+            df['vix_term_slope'] = df['VIX'] - df['VIX3M']
+
         # Cache it — convert Timestamp index to strings so json.dump doesn't crash
         cache_data = df.copy()
         cache_data.index = cache_data.index.astype(str)
         with open(cache_file, 'w') as f:
             json.dump(cache_data.to_dict(), f)
-        
+
         return df
     
-    def load_alpha_vantage_data(self, ticker: str) -> Dict:
-        """Load fundamentals from Alpha Vantage"""
-        cache_file = self.cache_dir / f"av_{ticker}.json"
-        
-        # Check cache
+    def load_fmp_fundamentals(self, ticker: str) -> Dict:
+        """Load fundamentals from Financial Modeling Prep (FMP).
+
+        Replaces Alpha Vantage — FMP free tier gives 250 req/day vs Alpha Vantage's 25.
+        Returns: PE_RATIO, PEG_RATIO, PROFIT_MARGIN, REVENUE_GROWTH_YOY,
+                 EARNINGS_SURPRISE_PCT, DEBT_TO_EQUITY, FCF_YIELD
+        """
+        cache_file = self.cache_dir / f"fmp_{ticker}.json"
+
+        # Check cache (24h TTL)
         if cache_file.exists():
             cache_age = time.time() - cache_file.stat().st_mtime
             if cache_age < 24 * 3600:
                 with open(cache_file, 'r') as f:
                     return json.load(f)
-        
-        api_key = os.getenv('ALPHA_VANTAGE_KEY')
+
+        api_key = self.fmp_api_key
         if not api_key:
+            logger.warning(f"FMP_API_KEY not set — skipping fundamentals for {ticker}. "
+                           "Get a free key at https://financialmodelingprep.com/developer/docs/")
             return {}
-        
+
+        result = {}
         try:
-            logger.info(f"Fetching Alpha Vantage data for {ticker}")
-            
-            # Get company overview
-            url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={api_key}"
-            response = requests.get(url, timeout=10)
-            data = response.json()
-            
-            if 'Symbol' in data:
-                # Cache it
+            logger.info(f"Fetching FMP fundamentals for {ticker}")
+
+            # 1. Company profile — PE, beta, market cap, description
+            url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={api_key}"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    p = data[0]
+                    result['PE_RATIO']      = float(p.get('pe') or 0)
+                    result['PROFIT_MARGIN'] = float(p.get('netProfitMargin') or 0) / 100  # FMP returns %
+                    result['DEBT_TO_EQUITY'] = float(p.get('debtToEquity') or 0)
+
+            # 2. Income statement — revenue growth YoY
+            url = (f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}"
+                   f"?limit=2&apikey={api_key}")
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                stmts = resp.json()
+                if len(stmts) >= 2:
+                    rev_now  = float(stmts[0].get('revenue') or 0)
+                    rev_prev = float(stmts[1].get('revenue') or 1)
+                    if rev_prev != 0:
+                        result['REVENUE_GROWTH_YOY'] = (rev_now - rev_prev) / abs(rev_prev)
+
+            # 3. Earnings surprises — most recent quarter
+            url = (f"https://financialmodelingprep.com/api/v3/earnings-surprises/{ticker}"
+                   f"?apikey={api_key}")
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                surprises = resp.json()
+                if surprises:
+                    s = surprises[0]
+                    actual   = float(s.get('actualEarningResult') or 0)
+                    estimate = float(s.get('estimatedEarning') or 0)
+                    if estimate != 0:
+                        result['EARNINGS_SURPRISE_PCT'] = (actual - estimate) / abs(estimate)
+
+            # 4. Key metrics — PEG ratio, FCF yield
+            url = (f"https://financialmodelingprep.com/api/v3/key-metrics/{ticker}"
+                   f"?limit=1&apikey={api_key}")
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                metrics = resp.json()
+                if metrics:
+                    m = metrics[0]
+                    result['PEG_RATIO']  = float(m.get('pegRatio') or 0)
+                    result['FCF_YIELD']  = float(m.get('freeCashFlowYield') or 0)
+
+            # Cache result
+            if result:
                 with open(cache_file, 'w') as f:
-                    json.dump(data, f)
-                return data
-            
-            logger.warning(f"Alpha Vantage returned: {data}")
+                    json.dump(result, f)
+                logger.info(f"FMP fundamentals cached for {ticker}: {list(result.keys())}")
+
         except Exception as e:
-            logger.warning(f"Alpha Vantage failed: {e}")
-        
-        return {}
+            logger.warning(f"FMP fundamentals failed for {ticker}: {e}")
+
+        return result
+
+    def load_fear_greed_index(self) -> float:
+        """Load CNN Fear & Greed Index (0 = Extreme Fear, 100 = Extreme Greed).
+
+        Uses CNN's public data endpoint. Cached for 24h since it's a single daily reading.
+        Free, no API key required.
+        """
+        cache_file = self.cache_dir / "fear_greed.json"
+
+        # Check cache (24h TTL — Fear & Greed updates once daily)
+        if cache_file.exists():
+            cache_age = time.time() - cache_file.stat().st_mtime
+            if cache_age < 24 * 3600:
+                with open(cache_file, 'r') as f:
+                    data = json.load(f)
+                return float(data.get('score', 50))
+
+        try:
+            url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+            resp = requests.get(url, timeout=10,
+                                headers={'User-Agent': 'Mozilla/5.0'})
+            if resp.status_code == 200:
+                data = resp.json()
+                score = float(data.get('fear_and_greed', {}).get('score', 50))
+                with open(cache_file, 'w') as f:
+                    json.dump({'score': score}, f)
+                logger.info(f"Fear & Greed Index: {score:.1f}")
+                return score
+        except Exception as e:
+            logger.warning(f"Fear & Greed fetch failed: {e}")
+
+        return 50.0  # neutral fallback
     
     def load_finnhub_data(self, ticker: str) -> Dict:
         """Load sentiment and insider trading from Finnhub"""
@@ -315,93 +351,112 @@ class DataPipeline:
             return []
     
     def get_yfinance_metadata(self, ticker: str) -> Dict:
-        """Get earnings dates, sector, etc from yfinance"""
+        """Get earnings dates, sector, etc from yfinance.
+
+        Also computes days_to_earnings — passed to options_analyzer to warn on IV crush risk.
+        """
         try:
             stock = yf.Ticker(ticker)
             info = stock.info
-            
+
             metadata = {
-                'sector': info.get('sector', 'Unknown'),
-                'market_cap': info.get('marketCap', 0),
-                'beta': info.get('beta', 1.0),
-                'forward_pe': info.get('forwardPE', None),
-                'week_52_high': info.get('fiftyTwoWeekHigh', None),
-                'week_52_low': info.get('fiftyTwoWeekLow', None),
+                'sector':        info.get('sector', 'Unknown'),
+                'market_cap':    info.get('marketCap', 0),
+                'beta':          info.get('beta', 1.0),
+                'forward_pe':    info.get('forwardPE', None),
+                'week_52_high':  info.get('fiftyTwoWeekHigh', None),
+                'week_52_low':   info.get('fiftyTwoWeekLow', None),
+                'days_to_earnings': None,
             }
-            
-            # Get next earnings date
+
+            # Extract next earnings date and compute days_to_earnings
             try:
                 calendar = stock.calendar
                 if calendar is not None and 'Earnings Date' in calendar:
                     next_earnings = calendar['Earnings Date'][0]
                     metadata['next_earnings_date'] = next_earnings
+                    # Compute days from today
+                    next_dt = pd.to_datetime(next_earnings)
+                    days = (next_dt.tz_localize(None) - pd.Timestamp.now()).days
+                    metadata['days_to_earnings'] = max(0, int(days))
+                    logger.info(f"{ticker} next earnings: {next_earnings} ({days} days)")
             except Exception:
                 metadata['next_earnings_date'] = None
-            
+
             return metadata
         except Exception as e:
             logger.warning(f"yfinance metadata failed: {e}")
             return {}
     
     def process_ticker(self, ticker: str) -> pd.DataFrame:
-        """Main pipeline: load and merge all data for a ticker"""
+        """Main pipeline: load and merge all data sources for a ticker"""
         logger.info(f"\n{'='*60}")
         logger.info(f"Processing {ticker}")
         logger.info(f"{'='*60}")
-        
-        # 1. Load price data (Kaggle + yfinance)
+
+        # 1. Load price data (yfinance only — Kaggle removed)
         df = self.merge_price_data(ticker)
-        
-        # 2. Load macro data
+
+        # 2. Load FRED macro data (VIX, rates, inflation, VIX term structure)
         macro_df = self.load_fred_macro_data()
-        
-        # Merge macro data (forward fill to daily) - skip if empty
         if not macro_df.empty:
             # Ensure both indices are timezone-naive datetime
-            df.index = pd.to_datetime(df.index).tz_localize(None)
+            df.index    = pd.to_datetime(df.index).tz_localize(None)
             macro_df.index = pd.to_datetime(macro_df.index).tz_localize(None)
-            
             macro_df = macro_df.reindex(df.index, method='ffill')
             df = pd.concat([df, macro_df], axis=1)
         else:
             logger.warning("No macro data available, skipping")
-        
-        # 3. Load fundamentals
-        av_data = self.load_alpha_vantage_data(ticker)
-        if av_data:
-            df['PE_RATIO'] = float(av_data.get('PERatio', 0) or 0)
-            df['PEG_RATIO'] = float(av_data.get('PEGRatio', 0) or 0)
-            df['PROFIT_MARGIN'] = float(av_data.get('ProfitMargin', 0) or 0)
-        
-        # 4. Load sentiment
+
+        # 3. Load Fear & Greed Index (free, single HTTP call)
+        fear_greed = self.load_fear_greed_index()
+        df['FEAR_GREED_INDEX'] = fear_greed   # scalar broadcast across all rows
+
+        # 4. Load FMP fundamentals (replaces Alpha Vantage — 250 req/day vs 25)
+        fmp_data = self.load_fmp_fundamentals(ticker)
+        if fmp_data:
+            df['PE_RATIO']             = float(fmp_data.get('PE_RATIO', 0) or 0)
+            df['PEG_RATIO']            = float(fmp_data.get('PEG_RATIO', 0) or 0)
+            df['PROFIT_MARGIN']        = float(fmp_data.get('PROFIT_MARGIN', 0) or 0)
+            df['REVENUE_GROWTH_YOY']   = float(fmp_data.get('REVENUE_GROWTH_YOY', 0) or 0)
+            df['EARNINGS_SURPRISE_PCT'] = float(fmp_data.get('EARNINGS_SURPRISE_PCT', 0) or 0)
+            df['DEBT_TO_EQUITY']       = float(fmp_data.get('DEBT_TO_EQUITY', 0) or 0)
+            df['FCF_YIELD']            = float(fmp_data.get('FCF_YIELD', 0) or 0)
+
+        # 5. Load Finnhub sentiment (bullish - bearish %, range -1 to +1)
+        #    Previously fetched but never wired into the dataframe or LLM — fixed here.
         finnhub_data = self.load_finnhub_data(ticker)
         if finnhub_data.get('sentiment'):
-            sentiment = finnhub_data['sentiment']
-            # Finnhub returns: {"buzz":{...}, "sentiment":{"bearishPercent":x,"bullishPercent":y}}
-            # The composite score is bullishPercent - bearishPercent, ranging -1 to +1
-            sent_data = sentiment.get('sentiment', {})
-            bull_pct = sent_data.get('bullishPercent', 0) or 0
-            bear_pct = sent_data.get('bearishPercent', 0) or 0
-            df['NEWS_SENTIMENT'] = float(bull_pct) - float(bear_pct)
-        
-        # 5. Store metadata (for later use)
+            sent_data = finnhub_data['sentiment'].get('sentiment', {})
+            bull_pct  = float(sent_data.get('bullishPercent', 0) or 0)
+            bear_pct  = float(sent_data.get('bearishPercent', 0) or 0)
+            df['NEWS_SENTIMENT'] = bull_pct - bear_pct  # -1 bearish … +1 bullish
+
+        # 6. Store metadata and earnings date
         metadata = self.get_yfinance_metadata(ticker)
         headlines = self.load_newsapi_headlines(ticker)
-        
+
+        # Inject days_to_earnings as a numeric column for feature engineering
+        days_to_earn = metadata.get('days_to_earnings')
+        if days_to_earn is not None:
+            df['days_to_earnings'] = int(days_to_earn)
+        else:
+            df['days_to_earnings'] = 999   # sentinel: no upcoming earnings known
+
         # Fill missing values
         df = df.ffill().bfill()
-        
+
         # Save to parquet
         output_file = f"data/processed/{ticker}.parquet"
         df.to_parquet(output_file)
         logger.info(f"Saved {len(df)} rows to {output_file}")
-        
-        # Save metadata separately
+
+        # Save metadata separately (headlines for LLM context)
         metadata['headlines'] = headlines
         metadata_file = f"data/processed/{ticker}_metadata.json"
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, default=str)
-        
+
         return df
 
 
@@ -410,6 +465,12 @@ if __name__ == "__main__":
     pipeline = DataPipeline()
     df = pipeline.process_ticker("NVDA")
     print(f"\nLoaded {len(df)} rows")
-    print(f"Columns: {list(df.columns)}")
-    print(f"\nLast 5 rows:")
-    print(df.tail())
+    new_cols = [c for c in df.columns if c in (
+        'VIX9D', 'VIX3M', 'vix_term_slope', 'FEAR_GREED_INDEX',
+        'REVENUE_GROWTH_YOY', 'EARNINGS_SURPRISE_PCT', 'DEBT_TO_EQUITY',
+        'FCF_YIELD', 'NEWS_SENTIMENT', 'days_to_earnings',
+    )]
+    print(f"New data columns present: {new_cols}")
+    print(f"\nLast 5 rows (key columns):")
+    show = ['Close'] + new_cols
+    print(df[[c for c in show if c in df.columns]].tail())

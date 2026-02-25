@@ -1,38 +1,34 @@
-# ============================================================================
-# AI Trading Signal System - Configuration
-# ============================================================================
-
-# ============================================================================
-# WATCHLIST - Tickers to Analyze
-# ============================================================================
 watchlist:
-  - NVDA    # NVIDIA Corporation
-  - QQQ     # Invesco QQQ ETF (NASDAQ-100)
-  - SPY     # SPDR S&P 500 ETF
-  - AAPL    # Apple Inc.
-  - MSFT    # Microsoft Corporation
-  - TSLA    # Tesla Inc.
-  - AMD     # Advanced Micro Devices
-  - META    # Meta Platforms (Facebook)
-  - AMZN    # Amazon.com Inc.
-  - GOOGL   # Alphabet Inc. (Google)
-
-# ============================================================================
-# MODEL PREDICTION SETTINGS
-# ============================================================================
-# How many days ahead to predict price movement
+- NVDA
+- QQQ
+- SPY
+- AAPL
+- MSFT
+- TSLA
+- AMD
+- META
+- AMZN
+- GOOGL
+- XLE
+- GLD
+- SLV
+- UBER
+- PLTR
+- SCHG
+- SPMO
+- VOO
+- B
+- GDX
+- SCHD
+- VST
+- FCX
+- SCCO
+- TGB
 prediction_horizon_days: 5
-
-# Minimum confidence threshold for generating signals (0.0 to 1.0)
-# Only signals above this threshold will be acted upon
 confidence_threshold: 0.65
-
-# Ensemble weights for combining model predictions
 ensemble_weights:
   xgboost: 0.6
   lstm: 0.4
-
-# Signal classification thresholds
 signal_thresholds:
   strong_bull: 0.72
   bull: 0.62
@@ -40,127 +36,54 @@ signal_thresholds:
   neutral_low: 0.45
   bear: 0.38
   strong_bear: 0.28
-
-# ============================================================================
-# OPTIONS TRADING PARAMETERS
-# ============================================================================
 options:
-  # Days to expiration range (sweet spot for probability of profit)
   dte_min: 14
   dte_max: 45
-  
-  # IV crush risk threshold (current_IV / historical_vol ratio)
-  # If above this AND near earnings, recommend spreads over naked calls
   iv_crush_threshold: 1.5
-  
-  # Days before earnings to consider high IV crush risk
   earnings_proximity_days: 5
-  
-  # Preferred strike selection (moneyness relative to current price)
-  preferred_moneyness_min: 0.98  # Slight OTM
+  preferred_moneyness_min: 0.98
   preferred_moneyness_max: 1.05
-  
-  # Delta range for optimal risk/reward
   preferred_delta_min: 0.35
   preferred_delta_max: 0.55
-  
-  # Minimum option liquidity (volume/open interest)
   min_volume_oi_ratio: 0.1
-
-# ============================================================================
-# RISK MANAGEMENT (Van Tharp Method)
-# ============================================================================
 risk_management:
-  # Maximum portfolio risk per trade as percentage of account
-  max_portfolio_risk_pct: 0.05  # 5% per trade
-  
-  # ATR multiplier for stop loss placement
+  max_portfolio_risk_pct: 0.05
   atr_stop_multiplier: 2.0
-  
-  # Account size for position sizing calculations
-  position_size_account: 1000  # $1,000 default
-  
-  # Maximum position size as percentage of account
-  max_position_pct: 0.20  # 20% max per position
-
-# ============================================================================
-# LLM SYNTHESIS ENGINE (Claude API)
-# ============================================================================
+  position_size_account: 1000
+  max_position_pct: 0.2
 llm:
-  # Model to use for trade recommendations
-  model: "claude-opus-4-6"
-  
-  # Maximum tokens in response
+  model: claude-opus-4-6
   max_tokens: 1500
-  
-  # Temperature (0.0 = deterministic, 1.0 = creative)
   temperature: 0.3
-  
-  # Cache TTL for LLM responses (hours)
   cache_ttl_hours: 24
-  
-  # Enable/disable LLM synthesis (set false to skip for faster/cheaper runs)
   enabled: true
-
-# ============================================================================
-# API RATE LIMITS
-# ============================================================================
 api_rate_limits:
-  # Alpha Vantage free tier
-  alpha_vantage_per_day: 25
-  alpha_vantage_retry_delay_seconds: 15
-  
-  # Finnhub free tier
+  fmp_per_day: 250
+  fmp_retry_delay_seconds: 1
   finnhub_per_minute: 60
   finnhub_retry_delay_seconds: 1
-  
-  # NewsAPI free tier
   newsapi_per_day: 100
   newsapi_retry_delay_seconds: 10
-  
-  # FRED API (very generous limits)
   fred_per_minute: 120
-  
-  # yfinance (no official limits, but be reasonable)
   yfinance_delay_seconds: 0.5
-  
-  # General retry configuration
   max_retries: 3
   exponential_backoff_base: 2
-
-# ============================================================================
-# DATA PIPELINE SETTINGS
-# ============================================================================
 data_pipeline:
-  # Kaggle data source
-  use_kaggle_api: false  # Set to false to use local files instead of API
-  kaggle_data_path: "../KaggleData"  # Path to local Kaggle CSV files
-  
-  # Cache TTL for API responses (hours)
   cache_ttl_hours: 24
-  
-  # Minimum required data points for valid analysis
   min_data_points: 200
-  
-  # Historical data lookback period (years) for Kaggle data
   historical_years: 20
-  
-  # Recent data lookback period (years) for yfinance
   recent_years: 2
-  
-  # Macro data update frequency
-  macro_update_frequency: "daily"
-  
-  # Missing data handling
-  fill_method: "forward_then_backward"  # Options: forward_then_backward, interpolate, drop
-
-# ============================================================================
-# FEATURE ENGINEERING
-# ============================================================================
+  macro_update_frequency: daily
+  fill_method: forward_then_backward
 feature_engineering:
-  # Technical indicator periods
-  ema_periods: [9, 21, 50, 200]
-  sma_periods: [20, 50]
+  ema_periods:
+  - 9
+  - 21
+  - 50
+  - 200
+  sma_periods:
+  - 20
+  - 50
   rsi_period: 14
   macd_fast: 12
   macd_slow: 26
@@ -168,94 +91,36 @@ feature_engineering:
   atr_period: 14
   bollinger_period: 20
   bollinger_std: 2
-  
-  # Pattern detection lookback periods
   pattern_lookback_short: 5
   pattern_lookback_medium: 10
   pattern_lookback_long: 20
-  
-  # Volatility calculation windows
   hist_vol_short: 20
   hist_vol_long: 60
-
-# ============================================================================
-# BACKTESTING
-# ============================================================================
 backtesting:
-  # Initial capital for backtests
   initial_capital: 10000
-  
-  # Entry signal threshold
   entry_threshold: 0.65
-  
-  # Holding period (days)
   holding_period: 5
-  
-  # Stop loss (ATR multiplier)
   stop_loss_atr: 2.0
-  
-  # Commission per trade (as decimal)
-  commission: 0.0  # Commission-free for simplicity
-  
-  # Slippage (as percentage)
-  slippage_pct: 0.001  # 0.1% slippage
-
-# ============================================================================
-# LOGGING CONFIGURATION
-# ============================================================================
+  commission: 0.0
+  slippage_pct: 0.001
 logging:
-  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
   level: INFO
-  
-  # Log file path
   file: logs/trading_ai.log
-  
-  # Maximum log file size (bytes)
-  max_bytes: 10485760  # 10 MB
-  
-  # Number of backup log files to keep
+  max_bytes: 10485760
   backup_count: 5
-  
-  # Log format
-  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  
-  # Date format
-  date_format: "%Y-%m-%d %H:%M:%S"
-
-# ============================================================================
-# DASHBOARD SETTINGS
-# ============================================================================
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  date_format: '%Y-%m-%d %H:%M:%S'
 dashboard:
-  # Auto-refresh interval (seconds) during market hours
   refresh_interval_seconds: 60
-  
-  # Market hours (US Eastern Time)
   market_open_hour: 9
   market_open_minute: 30
   market_close_hour: 16
   market_close_minute: 0
-  
-  # Default date range (days)
   default_date_range_days: 90
-  
-  # Number of top features to display
   top_features_display: 20
-  
-  # Chart height (pixels)
   chart_height: 600
-
-# ============================================================================
-# OUTPUT SETTINGS
-# ============================================================================
 output:
-  # Directory for daily signal reports
   signals_dir: outputs/signals
-  
-  # Directory for backtest results
   backtest_dir: outputs/backtests
-  
-  # File format for data exports
-  export_format: csv  # Options: csv, json, parquet
-  
-  # Include debug information in reports
+  export_format: csv
   include_debug_info: false

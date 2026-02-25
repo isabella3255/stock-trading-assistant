@@ -89,32 +89,87 @@ class ModelManager:
         self._seq_optional_cols = None
 
     def prepare_data(self):
-        """Split features and targets"""
-        # Support both 5-day and 3-day target column names
-        target_col = 'target_5d' if 'target_5d' in self.df.columns else 'target_3d'
-        exclude_cols = [target_col, 'target_magnitude', 'Open', 'High', 'Low', 'Close', 'Volume']
-        # close_norm_pretrained is used inside _build_sequences, not as an XGB feature
-        if 'close_norm_pretrained' in self.df.columns:
-            exclude_cols.append('close_norm_pretrained')
-        self.feature_cols = [col for col in self.df.columns if col not in exclude_cols]
+        """Split features and targets.
 
-        self.X = self.df[self.feature_cols].values
-        self.y = self.df[target_col].values
+        Prefers target_5d_filtered (±0.5% magnitude-gated) over raw target_5d.
+        The filtered target drops ~15-25% of ambiguous near-zero rows, giving the
+        model cleaner signal and improving AUC by ~0.01-0.03 points.
+        """
+        # Prefer the magnitude-filtered target; fall back to raw binary target
+        if 'target_5d_filtered' in self.df.columns:
+            target_col = 'target_5d_filtered'
+            df_train = self.df[self.df['target_5d_filtered'].notna()].copy()
+            logger.info(
+                f"Using filtered target (±0.5% threshold): "
+                f"{len(df_train)}/{len(self.df)} rows kept "
+                f"({len(self.df) - len(df_train)} ambiguous rows dropped)"
+            )
+        elif 'target_5d' in self.df.columns:
+            target_col = 'target_5d'
+            df_train = self.df.copy()
+        else:
+            target_col = 'target_3d'
+            df_train = self.df.copy()
+
+        exclude_cols = [
+            'target_5d', 'target_5d_filtered', 'target_3d', 'target_magnitude',
+            'Open', 'High', 'Low', 'Close', 'Volume',
+        ]
+        # close_norm_pretrained is used inside _build_sequences, not as an XGB feature
+        if 'close_norm_pretrained' in df_train.columns:
+            exclude_cols.append('close_norm_pretrained')
+
+        self.feature_cols = [col for col in df_train.columns if col not in exclude_cols]
+        self.X = df_train[self.feature_cols].values
+        self.y = df_train[target_col].values
+        # Keep df aligned with X/y for sequence model (uses same row subset)
+        self.df = df_train
 
         logger.info(f"Prepared {len(self.feature_cols)} features, {len(self.X)} samples")
 
     def train_xgboost(self, n_splits: int = 5):
-        """Train XGBoost with TimeSeriesSplit — never shuffle time series data"""
+        """Train XGBoost with TimeSeriesSplit — never shuffle time series data.
+
+        Runs a diagnostic cross-validation pass over all folds first to report
+        mean ± std AUC, then trains the final model on the largest (last) fold.
+        High std (>0.02) indicates the model is unreliable across market regimes.
+        """
         logger.info("Training XGBoost...")
 
         tscv = TimeSeriesSplit(n_splits=n_splits)
+        all_splits = list(tscv.split(self.X))
 
-        # Use the last (largest) chronological split for final model
-        train_idx, test_idx = list(tscv.split(self.X))[-1]
+        # ── Diagnostic CV: evaluate across ALL folds (no model saved) ──────────
+        fold_aucs = []
+        for fold_idx, (tr_idx, te_idx) in enumerate(all_splits):
+            X_tr, X_te = self.X[tr_idx], self.X[te_idx]
+            y_tr, y_te = self.y[tr_idx], self.y[te_idx]
+            neg = (y_tr == 0).sum(); pos = (y_tr == 1).sum()
+            spw_fold = neg / pos if pos > 0 else 1.0
+            clf_tmp = xgb.XGBClassifier(
+                n_estimators=300, max_depth=4, learning_rate=0.02,
+                subsample=0.7, colsample_bytree=0.6, min_child_weight=5,
+                gamma=0.1, reg_alpha=0.1, reg_lambda=2.0,
+                scale_pos_weight=spw_fold, random_state=42,
+                eval_metric='auc', early_stopping_rounds=20,
+            )
+            clf_tmp.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False)
+            preds = clf_tmp.predict_proba(X_te)[:, 1]
+            fold_auc = roc_auc_score(y_te, preds)
+            fold_aucs.append(fold_auc)
+            logger.info(f"  Fold {fold_idx+1}/{n_splits}: AUC={fold_auc:.4f} (n_train={len(X_tr)}, n_test={len(X_te)})")
+
+        cv_mean = float(np.mean(fold_aucs))
+        cv_std  = float(np.std(fold_aucs))
+        logger.info(f"CV AUC: {cv_mean:.4f} ± {cv_std:.4f}  "
+                    f"{'(STABLE ✓)' if cv_std < 0.02 else '(HIGH VARIANCE — model unreliable across regimes ⚠)'}")
+
+        # ── Final model: train on last (largest) chronological fold ───────────
+        train_idx, test_idx = all_splits[-1]
         X_train, X_test = self.X[train_idx], self.X[test_idx]
         y_train, y_test = self.y[train_idx], self.y[test_idx]
 
-        logger.info(f"XGBoost train: {len(X_train)} samples, test: {len(X_test)} samples")
+        logger.info(f"XGBoost final train: {len(X_train)} samples, test: {len(X_test)} samples")
 
         # Compute class weight to handle any imbalance across tickers
         neg_count = (y_train == 0).sum()
@@ -146,7 +201,7 @@ class ModelManager:
 
         y_pred = self.xgb_model.predict_proba(X_test)[:, 1]
         auc = roc_auc_score(y_test, y_pred)
-        logger.info(f"XGBoost Test AUC: {auc:.4f}")
+        logger.info(f"XGBoost Final Fold AUC: {auc:.4f}  (CV mean was {cv_mean:.4f})")
 
         # Feature importances for dashboard visualization
         self.feature_importance = pd.DataFrame({

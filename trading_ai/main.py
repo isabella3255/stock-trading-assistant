@@ -8,8 +8,10 @@ Runs full pipeline: Data → Features → Models → Options → LLM → Report
 import sys
 import os
 import argparse
+import json
 import yaml
 import logging
+import numpy as np
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
@@ -25,6 +27,18 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that converts numpy types to native Python so options data serializes cleanly."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 
 def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
@@ -85,21 +99,28 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
         options_result = {}
         if ml_result['signal'] in ['BULL', 'STRONG_BULL']:
             analyzer = OptionsAnalyzer(ticker, current_price, hist_vol)
-            options_result = analyzer.analyze(ml_result['signal'])
+            options_result = analyzer.analyze(
+                ml_result['signal'],
+                signal_score=ml_result['final_score'],   # used for half-Kelly sizing
+                days_to_earnings=int(days_to_earnings) if days_to_earnings else None,
+            )
 
-        # Build macro dict from latest row — all 6 FRED series are in the featured df
+        # Build macro dict from latest row — FRED series + Fear & Greed in the featured df
         macro = {
-            'vix':          float(latest.get('VIX', 0) or 0),
-            'fed_rate':     float(latest.get('FED_RATE', 0) or 0),
-            'treasury_10y': float(latest.get('TREASURY_10Y', 0) or 0),
-            'treasury_2y':  float(latest.get('TREASURY_2Y', 0) or 0),
-            'yield_curve':  float(latest.get('TREASURY_10Y', 0) or 0) - float(latest.get('TREASURY_2Y', 0) or 0),
-            'cpi':          float(latest.get('CPI', 0) or 0),
-            'unemployment': float(latest.get('UNEMPLOYMENT', 0) or 0),
+            'vix':              float(latest.get('VIX', 0) or 0),
+            'vix_3m':           float(latest.get('VIX3M', 0) or 0),
+            'vix_term_slope':   float(latest.get('vix_term_slope', 0) or 0),
+            'fear_greed_index': float(latest.get('FEAR_GREED_INDEX', 50) or 50),
+            'fed_rate':         float(latest.get('FED_RATE', 0) or 0),
+            'treasury_10y':     float(latest.get('TREASURY_10Y', 0) or 0),
+            'treasury_2y':      float(latest.get('TREASURY_2Y', 0) or 0),
+            'yield_curve':      float(latest.get('TREASURY_10Y', 0) or 0) - float(latest.get('TREASURY_2Y', 0) or 0),
+            'cpi':              float(latest.get('CPI', 0) or 0),
+            'unemployment':     float(latest.get('UNEMPLOYMENT', 0) or 0),
         }
 
-        # Build fundamentals from last row — PE_RATIO / PEG_RATIO / PROFIT_MARGIN
-        # are merged in from Alpha Vantage via the data pipeline
+        # Build fundamentals from last row — PE_RATIO / PEG_RATIO / PROFIT_MARGIN /
+        # REVENUE_GROWTH_YOY / EARNINGS_SURPRISE_PCT are merged in from FMP via the data pipeline
         def _safe_float(val):
             try:
                 v = float(val)
@@ -108,10 +129,17 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
                 return None
 
         fundamentals = {
-            'pe_ratio':      _safe_float(latest.get('PE_RATIO')),
-            'peg_ratio':     _safe_float(latest.get('PEG_RATIO')),
-            'profit_margin': _safe_float(latest.get('PROFIT_MARGIN')),
+            'pe_ratio':             _safe_float(latest.get('PE_RATIO')),
+            'peg_ratio':            _safe_float(latest.get('PEG_RATIO')),
+            'profit_margin':        _safe_float(latest.get('PROFIT_MARGIN')),
+            'revenue_growth_yoy':   _safe_float(latest.get('REVENUE_GROWTH_YOY')),
+            'earnings_surprise_pct':_safe_float(latest.get('EARNINGS_SURPRISE_PCT')),
+            'debt_to_equity':       _safe_float(latest.get('DEBT_TO_EQUITY')),
+            'fcf_yield':            _safe_float(latest.get('FCF_YIELD')),
         }
+
+        # Pass days_to_earnings to options analyzer so it can warn on IV crush
+        days_to_earnings = _safe_float(latest.get('days_to_earnings'))
 
         # Prepare data package for LLM
         data_package = {
@@ -138,6 +166,8 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
             'macro':        macro,
             'fundamentals': fundamentals,
             'headlines':    headlines,
+            # Finnhub composite sentiment score — now wired through to LLM
+            'finnhub_sentiment': float(latest.get('NEWS_SENTIMENT', 0) or 0),
         }
 
         # Phase 6: LLM Synthesis
@@ -146,15 +176,23 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
             synthesizer = LLMSynthesizer(config)
             llm_result = synthesizer.synthesize(ticker, data_package)
 
+        # Serialize options to clean JSON (avoids np.float64() repr in CSV)
+        options_json = json.dumps(options_result, cls=_NumpyEncoder) if options_result else ''
+
+        # Flatten LLM result — recommendation text is already saved to .txt and .json cache;
+        # store only the first 500 chars of the verdict in the CSV for dashboard display.
+        llm_verdict = (llm_result.get('recommendation', '') or '')[:500] if llm_result else ''
+
         return {
-            'ticker':    ticker,
-            'signal':    ml_result['signal'],
-            'score':     ml_result['final_score'],
-            'xgb_prob':  ml_result['xgb_prob'],
-            'seq_prob':  ml_result['lstm_prob'],   # renamed from lstm_prob for clarity
-            'options':   options_result,
-            'llm':       llm_result,
-            'success':   True,
+            'ticker':       ticker,
+            'signal':       ml_result['signal'],
+            'score':        ml_result['final_score'],
+            'xgb_prob':     ml_result['xgb_prob'],
+            'seq_prob':     ml_result['lstm_prob'],
+            'hist_vol':     hist_vol,                  # used by portfolio sizing below
+            'options_json': options_json,              # clean JSON string, parseable by dashboard
+            'llm_verdict':  llm_verdict,               # first 500 chars of LLM recommendation
+            'success':      True,
         }
 
     except Exception as e:
@@ -194,7 +232,6 @@ def main():
     """Main orchestrator"""
     parser = argparse.ArgumentParser(description="AI Trading Signal System")
     parser.add_argument("--ticker", type=str, help="Analyze single ticker")
-    parser.add_argument("--backtest", action="store_true", help="Run backtesting (not yet implemented)")
     parser.add_argument("--no-llm", action="store_true", help="Skip LLM synthesis")
     parser.add_argument(
         "--delete-models",
@@ -245,12 +282,71 @@ def main():
         else:
             print(f"{r['ticker']:<8} ERROR: {r.get('error', 'Unknown')}")
 
-    # Save report
+    # ── Portfolio-level risk summary ─────────────────────────────────────────
+    # Groups known-correlated tickers and warns when multiple correlated
+    # signals fire simultaneously — independent signals that look correlated
+    # should be sized down proportionally.
+    SECTOR_GROUPS = {
+        'Tech Mega-Cap': {'NVDA', 'AMD', 'MSFT', 'AAPL', 'GOOGL', 'META', 'AMZN'},
+        'Crypto-Adjacent': {'COIN', 'MSTR', 'RIOT'},
+        'Broad Market ETF': {'SPY', 'QQQ', 'VOO', 'SCHG', 'SPMO'},
+        'Energy': {'XLE', 'ENPH'},
+        'Gold/Silver': {'GLD', 'SLV'},
+        'Fintech/Growth': {'SOFI', 'UBER', 'PLTR', 'SHOP'},
+    }
+
+    successful = [r for r in results if r.get('success')]
+    bull_set = {r['ticker'] for r in successful if r.get('signal') in ('BULL', 'STRONG_BULL')}
+    bear_set = {r['ticker'] for r in successful if r.get('signal') in ('BEAR', 'STRONG_BEAR')}
+
+    print("\n" + "="*70)
+    print("PORTFOLIO RISK ANALYSIS")
+    print("="*70)
+
+    if not bull_set and not bear_set:
+        print("\n  No actionable signals today — all tickers NEUTRAL.")
+    else:
+        # Concentration warnings
+        warnings_issued = False
+        for group_name, group_tickers in SECTOR_GROUPS.items():
+            bull_in_group = bull_set & group_tickers
+            if len(bull_in_group) >= 3:
+                print(f"\n  ⚠️  HIGH CONCENTRATION — {group_name}: {len(bull_in_group)} tickers BULLISH")
+                print(f"     {', '.join(sorted(bull_in_group))}")
+                print(f"     These signals are correlated — treat as ONE position, not {len(bull_in_group)}.")
+                warnings_issued = True
+
+        if not warnings_issued:
+            print("\n  ✅ No sector concentration warnings.")
+
+        # Vol-adjusted position sizing for actionable signals
+        print(f"\n  {'Ticker':<8} {'Signal':<14} {'HV-20':<8} {'Suggested Size'}")
+        print(f"  {'-'*50}")
+        for r in sorted(successful, key=lambda x: x.get('score', 0), reverse=True):
+            sig = r.get('signal', '')
+            if sig not in ('BULL', 'STRONG_BULL', 'BEAR', 'STRONG_BEAR'):
+                continue
+            hv = r.get('hist_vol', 0.0) or 0.02  # annualized HV-20
+            ann_vol = hv * (252 ** 0.5) if hv < 1 else hv  # already annualized in feature eng
+            # Vol-adjusted equal-risk sizing: target 1% portfolio daily vol per position
+            # size = (target_daily_vol / asset_daily_vol) capped at 5%
+            daily_vol = ann_vol / (252 ** 0.5)
+            raw_size = 0.01 / max(daily_vol, 0.001) * 100  # as % of portfolio
+            size_pct = round(min(5.0, max(0.5, raw_size)), 1)
+            direction = "LONG" if sig in ('BULL', 'STRONG_BULL') else "SHORT/PUT"
+            print(f"  {r['ticker']:<8} {sig:<14} {ann_vol:<8.1%} ≤{size_pct}% ({direction})")
+
+    # Save report (hist_vol column used for risk display, not needed in CSV)
     today = datetime.now().strftime('%Y-%m-%d')
     report_file = f"outputs/signals/daily_report_{today}.csv"
     Path("outputs/signals").mkdir(parents=True, exist_ok=True)
 
-    df_results = pd.DataFrame([r for r in results if r['success']])
+    csv_rows = []
+    for r in results:
+        if r.get('success'):
+            csv_rows.append({k: v for k, v in r.items() if k != 'hist_vol'})
+
+    df_results = pd.DataFrame(csv_rows)
     if not df_results.empty:
         df_results.to_csv(report_file, index=False)
         print(f"\nReport saved to: {report_file}")

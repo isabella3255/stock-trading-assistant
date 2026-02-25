@@ -12,6 +12,7 @@ Usage:
 
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import streamlit as st
+import yaml
 
 # ---------------------------------------------------------------------------
 # Resolve paths regardless of working directory
@@ -28,6 +30,26 @@ sys.path.insert(0, str(ROOT))
 
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env", override=True)
+
+
+# ---------------------------------------------------------------------------
+# Config helpers — read/write config.yaml so all modules stay in sync
+# ---------------------------------------------------------------------------
+CONFIG_PATH = ROOT / "config" / "config.yaml"
+
+
+def load_config() -> dict:
+    with open(CONFIG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def save_config(cfg: dict) -> None:
+    with open(CONFIG_PATH, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+
+def get_watchlist() -> list[str]:
+    return load_config().get("watchlist", [])
 
 
 # ---------------------------------------------------------------------------
@@ -149,61 +171,122 @@ def score_bar(score: float) -> None:
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
+def _run_cmd(cmd: list, label: str, success_msg: str) -> None:
+    """Run a subprocess command and show live log output in an expander."""
+    with st.spinner(f"{label}…"):
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=ROOT
+        )
+    if result.returncode == 0:
+        st.success(success_msg)
+        st.cache_data.clear()
+    else:
+        st.error(f"{label} failed (exit {result.returncode})")
+    # Show combined stdout+stderr in a collapsible log
+    log_text = (result.stdout or "") + (result.stderr or "")
+    if log_text.strip():
+        with st.expander("📋 View log output", expanded=result.returncode != 0):
+            st.code(log_text[-4000:], language="text")   # last 4000 chars
+
+
 with st.sidebar:
     st.image("https://img.shields.io/badge/AI%20Trading-Signal%20System-blue?style=for-the-badge")
     st.markdown("---")
 
-    all_tickers = ["NVDA", "QQQ", "SPY", "AAPL", "MSFT", "TSLA", "AMD", "META", "AMZN", "GOOGL"]
+    # ── Ticker selector — reads live from config.yaml ─────────────────────
+    all_tickers = get_watchlist()
+    if not all_tickers:
+        st.warning("Watchlist is empty. Add tickers in the ⚙️ Manage Watchlist tab.")
+        all_tickers = ["NVDA"]
     ticker = st.selectbox("🔍 Select Ticker", all_tickers, index=0)
 
     st.markdown("---")
     st.markdown("### ⚡ Quick Actions")
 
-    run_pipeline = st.button("🔄 Refresh Data & Run Pipeline", width='stretch')
-    if run_pipeline:
-        with st.spinner(f"Running pipeline for {ticker}…"):
-            import subprocess
-            result = subprocess.run(
-                [sys.executable, "main.py", "--ticker", ticker, "--no-llm"],
-                capture_output=True, text=True, cwd=ROOT
-            )
-            if result.returncode == 0:
-                st.success("Pipeline complete!")
-                st.cache_data.clear()
-            else:
-                st.error(f"Pipeline failed:\n{result.stderr[-500:]}")
+    # ── Per-ticker actions ─────────────────────────────────────────────────
+    st.markdown("**Single Ticker**")
 
-    run_llm = st.button("🤖 Run Full Analysis (with LLM)", width='stretch')
-    if run_llm:
-        with st.spinner(f"Running LLM analysis for {ticker}…"):
-            import subprocess
-            result = subprocess.run(
-                [sys.executable, "main.py", "--ticker", ticker],
-                capture_output=True, text=True, cwd=ROOT
-            )
-            if result.returncode == 0:
-                st.success("LLM analysis complete!")
-                st.cache_data.clear()
-            else:
-                st.error(f"LLM failed:\n{result.stderr[-500:]}")
+    if st.button("📥 Pull Data Only", key="pull_data", use_container_width=True,
+                 help="Runs run_pipeline.py for this ticker — fetches fresh OHLCV, macro, fundamentals"):
+        _run_cmd(
+            [sys.executable, "run_pipeline.py", "--tickers", ticker],
+            f"Pulling data for {ticker}",
+            f"Data pulled for {ticker}!",
+        )
 
-    run_all = st.button("🏃 Run All 10 Tickers", width='stretch')
-    if run_all:
-        with st.spinner("Running all tickers (no LLM)…"):
-            import subprocess
-            result = subprocess.run(
-                [sys.executable, "main.py", "--no-llm"],
-                capture_output=True, text=True, cwd=ROOT
-            )
-            if result.returncode == 0:
-                st.success("All tickers processed!")
-                st.cache_data.clear()
-            else:
-                st.error(f"Failed:\n{result.stderr[-500:]}")
+    if st.button("🔄 Analyze (No LLM)", key="run_ticker_nollm", use_container_width=True,
+                 help="Runs main.py --ticker {ticker} --no-llm — fast signal refresh"):
+        _run_cmd(
+            [sys.executable, "main.py", "--ticker", ticker, "--no-llm"],
+            f"Analyzing {ticker}",
+            f"Signal updated for {ticker}!",
+        )
+
+    if st.button("🤖 Analyze + LLM", key="run_ticker_llm", use_container_width=True,
+                 help="Runs main.py --ticker {ticker} — full pipeline with Claude AI recommendation"):
+        _run_cmd(
+            [sys.executable, "main.py", "--ticker", ticker],
+            f"LLM analysis for {ticker}",
+            f"LLM recommendation generated for {ticker}!",
+        )
+
+    st.markdown("---")
+    st.markdown("**All Watchlist Tickers**")
+
+    if st.button("📥 Pull All Data", key="pull_all_data", use_container_width=True,
+                 help="Runs run_pipeline.py for every ticker in your watchlist"):
+        _run_cmd(
+            [sys.executable, "run_pipeline.py"],
+            "Pulling data for all tickers",
+            "All data pulled!",
+        )
+
+    if st.button("🏃 Analyze All (No LLM)", key="run_all_nollm", use_container_width=True,
+                 help="Runs main.py --no-llm — signals for all watchlist tickers"):
+        _run_cmd(
+            [sys.executable, "main.py", "--no-llm"],
+            f"Analyzing all {len(all_tickers)} tickers",
+            "All tickers analyzed!",
+        )
+
+    if st.button("🤖 Analyze All + LLM", key="run_all_llm", use_container_width=True,
+                 help="Runs main.py — full pipeline with LLM for every ticker (slow — uses API credits)"):
+        _run_cmd(
+            [sys.executable, "main.py"],
+            f"Full LLM analysis for all {len(all_tickers)} tickers",
+            "Full analysis complete!",
+        )
+
+    st.markdown("---")
+    st.markdown("**Model Training**")
+
+    if st.button("🧠 Retrain Model", key="retrain", use_container_width=True,
+                 help="Runs python -m modules.ml_models — retrains XGBoost + MLP on all parquet files"):
+        _run_cmd(
+            [sys.executable, "-m", "modules.ml_models"],
+            "Retraining combined model",
+            "Model retrained!",
+        )
+
+    if st.button("🔬 Retrain + Optuna Tune", key="retrain_tune", use_container_width=True,
+                 help="Retrains with Optuna hyperparameter search (~5-10 min). Uses --tune --tune-trials 30"):
+        _run_cmd(
+            [sys.executable, "-m", "modules.ml_models", "--tune", "--tune-trials", "30"],
+            "Retraining with Optuna tuning (this takes ~5-10 min)",
+            "Model retrained with tuned hyperparameters!",
+        )
+
+    if st.button("🗑️ Clean Stale Models", key="clean_models", use_container_width=True,
+                 help="Runs main.py --delete-models --no-llm --ticker NVDA — removes per-ticker model files"):
+        _run_cmd(
+            [sys.executable, "main.py", "--delete-models", "--ticker", ticker, "--no-llm"],
+            "Cleaning stale per-ticker model files",
+            "Stale models cleaned!",
+        )
 
     st.markdown("---")
     st.caption(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    st.caption("Powered by Claude AI · Phase 7")
+    st.caption(f"Watchlist: {len(all_tickers)} tickers · Powered by Claude AI")
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +310,7 @@ tabs = st.tabs([
     "🤖 AI Recommendation",
     "⚡ Feature Importance",
     "📋 All Tickers",
-    "🔬 Backtesting",
+    "⚙️ Manage Watchlist",
 ])
 
 # ---------------------------------------------------------------
@@ -282,22 +365,41 @@ with tabs[0]:
 
         # Macro snapshot
         st.markdown("#### 🌍 Macro Snapshot")
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("VIX",          f"{float(latest.get('VIX', 0) or 0):.1f}")
         m2.metric("Fed Rate",     f"{float(latest.get('FED_RATE', 0) or 0):.2f}%")
         m3.metric("10Y Yield",    f"{float(latest.get('TREASURY_10Y', 0) or 0):.2f}%")
         m4.metric("CPI",          f"{float(latest.get('CPI', 0) or 0):.1f}")
         m5.metric("Unemployment", f"{float(latest.get('UNEMPLOYMENT', 0) or 0):.1f}%")
+        fg = float(latest.get('FEAR_GREED_INDEX', 50) or 50)
+        fg_label = "Extr.Fear" if fg < 25 else "Fear" if fg < 45 else "Neutral" if fg < 55 else "Greed" if fg < 75 else "Extr.Greed"
+        m6.metric("Fear & Greed", f"{fg:.0f} — {fg_label}")
+
+        # VIX term structure
+        vix30 = float(latest.get('VIX', 0) or 0)
+        vix3m = float(latest.get('VIX3M', 0) or 0)
+        slope = float(latest.get('vix_term_slope', 0) or 0)
+        if vix3m > 0:
+            st.markdown("#### 📐 VIX Term Structure")
+            vt1, vt2, vt3 = st.columns(3)
+            vt1.metric("VIX (30-Day)",  f"{vix30:.1f}")
+            vt2.metric("VIX 3-Month",   f"{vix3m:.1f}")
+            vt3.metric("Slope (30D-3M)", f"{slope:+.2f}",
+                       help="Negative = normal contango/calm, Positive = inverted/fear spike")
 
         # Fundamental snapshot
         st.markdown("#### 📋 Fundamentals")
-        f1, f2, f3 = st.columns(3)
-        pe  = latest.get("PE_RATIO")
-        peg = latest.get("PEG_RATIO")
-        pm  = latest.get("PROFIT_MARGIN")
-        f1.metric("P/E Ratio",     f"{float(pe):.1f}"  if pe  and float(pe)  != 0 else "N/A")
-        f2.metric("PEG Ratio",     f"{float(peg):.2f}" if peg and float(peg) != 0 else "N/A")
-        f3.metric("Profit Margin", f"{float(pm):.1%}"  if pm  and float(pm)  != 0 else "N/A")
+        f1, f2, f3, f4, f5 = st.columns(5)
+        pe   = latest.get("PE_RATIO")
+        peg  = latest.get("PEG_RATIO")
+        pm   = latest.get("PROFIT_MARGIN")
+        rg   = latest.get("REVENUE_GROWTH_YOY")
+        es   = latest.get("EARNINGS_SURPRISE_PCT")
+        f1.metric("P/E Ratio",      f"{float(pe):.1f}"   if pe  and float(pe)  != 0 else "N/A")
+        f2.metric("PEG Ratio",      f"{float(peg):.2f}"  if peg and float(peg) != 0 else "N/A")
+        f3.metric("Profit Margin",  f"{float(pm):.1%}"   if pm  and float(pm)  != 0 else "N/A")
+        f4.metric("Revenue Growth", f"{float(rg):+.1%}"  if rg  and float(rg)  != 0 else "N/A")
+        f5.metric("EPS Surprise",   f"{float(es):+.1%}"  if es  and float(es)  != 0 else "N/A")
 
         # Pattern flags
         st.markdown("#### 🚦 Pattern Flags")
@@ -362,8 +464,8 @@ with tabs[1]:
                         line=style, showlegend=False,
                     ), row=1, col=1)
 
-            # MACD
-            if "MACD_hist" in plot_df.columns and "MACD_line" in plot_df.columns:
+            # MACD — feature engineering creates 'MACD' (not 'MACD_line')
+            if "MACD_hist" in plot_df.columns and "MACD" in plot_df.columns:
                 fig.add_trace(go.Bar(
                     x=plot_df.index, y=plot_df["MACD_hist"],
                     name="MACD Hist",
@@ -372,7 +474,7 @@ with tabs[1]:
                     ),
                 ), row=2, col=1)
                 fig.add_trace(go.Scatter(
-                    x=plot_df.index, y=plot_df["MACD_line"],
+                    x=plot_df.index, y=plot_df["MACD"],
                     name="MACD", line=dict(color="#1e88e5", width=1),
                 ), row=2, col=1)
                 if "MACD_signal" in plot_df.columns:
@@ -709,115 +811,152 @@ with tabs[6]:
 
 
 # ---------------------------------------------------------------
-# TAB 8: BACKTESTING
+# TAB 8: MANAGE WATCHLIST
 # ---------------------------------------------------------------
 with tabs[7]:
-    st.subheader("Backtesting")
+    st.subheader("⚙️ Manage Watchlist")
+    st.markdown(
+        "Add or remove tickers from your watchlist. Changes are written to "
+        "`config/config.yaml` and immediately reflected across all modules "
+        "(main.py, run_pipeline.py, ml_models.py) and this dashboard."
+    )
 
-    if df is None:
-        st.warning("Load data first.")
-    else:
-        st.markdown("""
-        Backtest simulates holding a position for N days whenever the ensemble score
-        exceeds the entry threshold. Assumes no commissions and 0.1% slippage.
-        """)
+    # Re-read live so this tab always shows the current state
+    current_watchlist = get_watchlist()
 
-        col_bt1, col_bt2, col_bt3 = st.columns(3)
-        entry_thresh  = col_bt1.slider("Entry Threshold", 0.55, 0.80, 0.65, 0.01)
-        hold_days     = col_bt2.slider("Hold Period (days)", 1, 20, 5)
-        initial_cap   = col_bt3.number_input("Initial Capital ($)", 1000, 100000, 10000, 1000)
+    col_left, col_right = st.columns([3, 2])
 
-        run_bt = st.button("▶ Run Backtest", key="bt_btn")
+    with col_left:
+        # ── Current watchlist with remove buttons ──────────────────────────
+        st.markdown("### 📋 Current Watchlist")
+        if not current_watchlist:
+            st.info("No tickers in watchlist. Add some below.")
+        else:
+            # Show each ticker with its data status and a remove button
+            for i, t in enumerate(current_watchlist):
+                parquet_ok = (ROOT / "data" / "processed" / f"{t}_featured.parquet").exists()
+                model_ok   = (ROOT / "models" / "xgboost" / "NVDA.pkl").exists()
+                data_icon  = "✅" if parquet_ok else "⚠️"
+                data_tip   = "Data ready" if parquet_ok else "No data — pull data after adding"
 
-        if run_bt:
-            with st.spinner("Running backtest…"):
-                try:
-                    target_col = "target_5d" if "target_5d" in df.columns else "target_3d"
-                    if target_col not in df.columns:
-                        st.error("No target column found in featured data.")
-                    else:
-                        # Simple backtest: signal from target column (proxy for model prediction)
-                        # In production you'd use saved model predictions here
-                        bt_df = df[["Close", target_col]].copy().dropna()
-                        bt_df = bt_df[bt_df[target_col].isin([0, 1])]
+                col_t, col_status, col_btn = st.columns([3, 2, 1])
+                col_t.markdown(f"**{t}**")
+                col_status.markdown(
+                    f'<span title="{data_tip}">{data_icon} {"Ready" if parquet_ok else "No data"}</span>',
+                    unsafe_allow_html=True,
+                )
+                if col_btn.button("➖", key=f"remove_{t}_{i}", help=f"Remove {t} from watchlist"):
+                    cfg = load_config()
+                    cfg["watchlist"] = [x for x in cfg["watchlist"] if x != t]
+                    save_config(cfg)
+                    st.success(f"Removed **{t}** from watchlist.")
+                    st.cache_data.clear()
+                    st.rerun()
 
-                        # Simulate: enter when target=1 (model predicted correctly),
-                        # use actual 5d return
-                        bt_df["fwd_return"] = (
-                            bt_df["Close"].shift(-hold_days) / bt_df["Close"] - 1
-                        )
-                        bt_df = bt_df.dropna(subset=["fwd_return"])
+        st.markdown(f"**Total: {len(current_watchlist)} tickers**")
 
-                        # Simple buy-and-hold baseline
-                        bh_return = bt_df["Close"].iloc[-1] / bt_df["Close"].iloc[0] - 1
+    with col_right:
+        # ── Add new ticker ─────────────────────────────────────────────────
+        st.markdown("### ➕ Add Ticker")
+        new_ticker = st.text_input(
+            "Ticker symbol",
+            placeholder="e.g. NVDA, MSFT, BTC-USD",
+            max_chars=12,
+            key="new_ticker_input",
+        ).strip().upper()
 
-                        # Strategy: take every trade where target=1 (simulating ML signal)
-                        trades = bt_df[bt_df[target_col] == 1].copy()
-                        slippage = 0.001
-                        trades["net_return"] = trades["fwd_return"] - slippage
+        validate_first = st.checkbox(
+            "Validate with yfinance before adding",
+            value=True,
+            help="Checks that yfinance can find price data for this ticker. Uncheck for crypto or ETFs that may have unusual symbols.",
+        )
 
-                        wins       = (trades["net_return"] > 0).sum()
-                        losses     = (trades["net_return"] <= 0).sum()
-                        total_tr   = len(trades)
-                        win_rate   = wins / total_tr if total_tr > 0 else 0
-                        avg_win    = trades.loc[trades["net_return"] > 0, "net_return"].mean()
-                        avg_loss   = trades.loc[trades["net_return"] <= 0, "net_return"].mean()
-                        profit_factor = (
-                            abs(wins * (avg_win or 0)) / abs(losses * (avg_loss or 1))
-                            if losses > 0 else float("inf")
-                        )
+        col_add1, col_add2 = st.columns(2)
+        add_btn = col_add1.button("➕ Add to Watchlist", type="primary", use_container_width=True)
+        pull_after = col_add2.checkbox("Pull data immediately after adding", value=True)
 
-                        # Equity curve (compound, sequential trades)
-                        equity = [initial_cap]
-                        for ret in trades["net_return"].values:
-                            equity.append(equity[-1] * (1 + ret))
-
-                        eq_series = pd.Series(equity, index=range(len(equity)))
-                        peak       = eq_series.cummax()
-                        drawdown   = (eq_series - peak) / peak
-                        max_dd     = drawdown.min()
-                        final_cap  = equity[-1]
-                        total_ret  = (final_cap - initial_cap) / initial_cap
-
-                        # Summary
-                        st.markdown("#### Backtest Results")
-                        r1, r2, r3, r4 = st.columns(4)
-                        r1.metric("Total Trades",   f"{total_tr:,}")
-                        r2.metric("Win Rate",        f"{win_rate:.1%}")
-                        r3.metric("Profit Factor",   f"{profit_factor:.2f}")
-                        r4.metric("Max Drawdown",    f"{max_dd:.1%}")
-
-                        r5, r6, r7, r8 = st.columns(4)
-                        r5.metric("Total Return",    f"{total_ret:.1%}")
-                        r6.metric("B&H Return",      f"{bh_return:.1%}")
-                        r7.metric("Avg Win",         f"{avg_win:.2%}" if avg_win == avg_win else "N/A")
-                        r8.metric("Avg Loss",        f"{avg_loss:.2%}" if avg_loss == avg_loss else "N/A")
-
-                        # Equity curve chart
+        if add_btn and new_ticker:
+            if new_ticker in current_watchlist:
+                st.warning(f"**{new_ticker}** is already in your watchlist.")
+            else:
+                # Optional yfinance validation
+                valid = True
+                if validate_first:
+                    with st.spinner(f"Validating {new_ticker} with yfinance…"):
                         try:
-                            import plotly.express as px
-                            fig = px.line(
-                                x=range(len(equity)), y=equity,
-                                title=f"{ticker} Equity Curve — ${initial_cap:,} → ${final_cap:,.0f}",
-                                labels={"x": "Trade #", "y": "Portfolio Value ($)"},
-                            )
-                            fig.add_hline(y=initial_cap, line_dash="dot",
-                                          annotation_text="Starting Capital")
-                            fig.update_layout(template="plotly_dark")
-                            st.plotly_chart(fig, width='stretch')
-                        except ImportError:
-                            st.line_chart(equity)
+                            import yfinance as yf
+                            info = yf.Ticker(new_ticker).fast_info
+                            last_price = getattr(info, "last_price", None)
+                            if last_price is None or last_price == 0:
+                                hist = yf.Ticker(new_ticker).history(period="5d")
+                                valid = not hist.empty
+                            else:
+                                valid = True
+                        except Exception:
+                            valid = False
 
-                        st.caption(
-                            "⚠️ This is a simplified backtest using actual forward returns. "
-                            "A production backtest would use model predictions on unseen data, "
-                            "not the target column (which is computed from future prices)."
+                if not valid:
+                    st.error(
+                        f"❌ **{new_ticker}** could not be validated via yfinance. "
+                        "Check the symbol or uncheck 'Validate' to add anyway."
+                    )
+                else:
+                    # Write to config.yaml
+                    cfg = load_config()
+                    cfg["watchlist"].append(new_ticker)
+                    save_config(cfg)
+                    st.success(f"✅ Added **{new_ticker}** to watchlist.")
+                    st.cache_data.clear()
+
+                    if pull_after:
+                        _run_cmd(
+                            [sys.executable, "run_pipeline.py", "--tickers", new_ticker],
+                            f"Pulling data for {new_ticker}",
+                            f"Data ready for {new_ticker}! You can now run analysis.",
                         )
 
-                except Exception as e:
-                    st.error(f"Backtest error: {e}")
-                    import traceback
-                    st.code(traceback.format_exc())
+                    st.rerun()
+
+        st.markdown("---")
+        # ── Bulk operations ────────────────────────────────────────────────
+        st.markdown("### 🔧 Bulk Operations")
+
+        if st.button("📥 Pull Data for All Missing Tickers", use_container_width=True,
+                     help="Runs run_pipeline.py --skip-existing — only processes tickers without data files"):
+            _run_cmd(
+                [sys.executable, "run_pipeline.py", "--skip-existing"],
+                "Pulling data for tickers with missing parquet files",
+                "Done! All tickers with missing data have been refreshed.",
+            )
+
+        if st.button("🔄 Refresh All Data (Force)", use_container_width=True,
+                     help="Runs run_pipeline.py for ALL tickers — overwrites existing data"):
+            _run_cmd(
+                [sys.executable, "run_pipeline.py"],
+                f"Force-refreshing data for all {len(current_watchlist)} tickers",
+                "All data refreshed!",
+            )
+
+        if st.button("🧠 Retrain Model (All Tickers)", use_container_width=True,
+                     help="After adding/removing tickers, retrain the combined model to include new data"):
+            _run_cmd(
+                [sys.executable, "-m", "modules.ml_models"],
+                "Retraining combined model on all watchlist tickers",
+                "Model retrained with updated watchlist!",
+            )
+
+        st.markdown("---")
+        # ── Config preview ─────────────────────────────────────────────────
+        st.markdown("### 📄 Current config.yaml Watchlist")
+        st.code("\n".join(f"- {t}" for t in current_watchlist), language="yaml")
+
+        st.download_button(
+            "💾 Download config.yaml",
+            data=CONFIG_PATH.read_text(),
+            file_name="config.yaml",
+            mime="text/yaml",
+            use_container_width=True,
+        )
 
 
 # ---------------------------------------------------------------

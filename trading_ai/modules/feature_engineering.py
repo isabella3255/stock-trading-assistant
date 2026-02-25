@@ -6,8 +6,8 @@ Computes 70+ technical indicators and features from OHLCV data.
 
 import pandas as pd
 import numpy as np
-from ta.trend import EMAIndicator, SMAIndicator, MACD
-from ta.momentum import RSIIndicator, ROCIndicator, StochasticOscillator
+from ta.trend import EMAIndicator, SMAIndicator, MACD, ADXIndicator
+from ta.momentum import RSIIndicator, ROCIndicator, StochasticOscillator, WilliamsRIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.volume import OnBalanceVolumeIndicator
 import logging
@@ -72,6 +72,11 @@ class FeatureEngineer:
         stoch = StochasticOscillator(self.df['High'], self.df['Low'], close, window=14, smooth_window=3)
         self.df['Stoch_K'] = stoch.stoch()
         self.df['Stoch_D'] = stoch.stoch_signal()
+
+        # Williams %R — complements RSI; measures close relative to high-low range
+        # Range: 0 (overbought) to -100 (oversold); values > -20 = overbought, < -80 = oversold
+        williams = WilliamsRIndicator(self.df['High'], self.df['Low'], close, lbp=14)
+        self.df['Williams_R'] = williams.williams_r()
         
     def add_volatility_features(self):
         """ATR, Bollinger Bands, Historical Volatility"""
@@ -99,6 +104,15 @@ class FeatureEngineer:
         self.df['hist_volatility_20'] = log_returns.rolling(20).std() * np.sqrt(252)
         self.df['hist_volatility_60'] = log_returns.rolling(60).std() * np.sqrt(252)
         self.df['hv_ratio'] = self.df['hist_volatility_20'] / self.df['hist_volatility_60']
+
+        # Average Directional Index (ADX) — distinguishes trending vs ranging regimes.
+        # ADX > 25 indicates a strong trend (either direction); < 20 = choppy/ranging.
+        # +DI and -DI show whether the trend is bullish or bearish.
+        adx_ind = ADXIndicator(high, low, close, window=14)
+        self.df['ADX'] = adx_ind.adx()
+        self.df['ADX_pos'] = adx_ind.adx_pos()   # +DI (bullish trend strength)
+        self.df['ADX_neg'] = adx_ind.adx_neg()   # -DI (bearish trend strength)
+        self.df['strong_trend'] = (self.df['ADX'] > 25).astype(int)  # 1 = trending, 0 = ranging
         
     def add_volume_features(self):
         """VWAP, volume ratios, OBV"""
@@ -158,12 +172,23 @@ class FeatureEngineer:
         """Target for ML: price up/down in N days"""
         close = self.df['Close']
 
-        # Binary target: 1 if price goes up
         future_price = close.shift(-horizon)
+        pct_change = (future_price - close) / close * 100
+
+        # Binary target: 1 if price goes up at all (noisy — used for reference)
         self.df['target_5d'] = (future_price > close).astype(int)
 
         # Magnitude target: % change
-        self.df['target_magnitude'] = ((future_price - close) / close) * 100
+        self.df['target_magnitude'] = pct_change
+
+        # Filtered target: only label clear directional moves (≥ ±0.5%).
+        # Rows within ±0.5% are NaN — these ambiguous "noise" rows are excluded
+        # during training so the model learns from cleaner signal.
+        # ML training uses this column; target_5d is kept for legacy/analysis.
+        self.df['target_5d_filtered'] = np.where(
+            pct_change > 0.5, 1.0,
+            np.where(pct_change < -0.5, 0.0, np.nan)
+        )
         
     def compute_all_features(self) -> pd.DataFrame:
         """Run all feature computations"""
@@ -185,9 +210,25 @@ class FeatureEngineer:
         logger.info("Adding target variables...")
         self.add_target_variables()
         
-        # Forward-fill macro columns before dropping — they update infrequently
-        # and would otherwise wipe out years of historical price data
-        macro_cols = ['VIX', 'FED_RATE', 'TREASURY_10Y', 'TREASURY_2Y', 'CPI', 'UNEMPLOYMENT']
+        # Forward-fill macro + fundamental columns before dropping.
+        # These update infrequently (daily/quarterly) and must not introduce NaN
+        # into the training rows from sparse FRED series.
+        macro_cols = [
+            # FRED core
+            'VIX', 'FED_RATE', 'TREASURY_10Y', 'TREASURY_2Y', 'CPI', 'UNEMPLOYMENT',
+            # FRED VIX term structure (new)
+            'VIX3M', 'vix_term_slope',
+            # CNN sentiment (new)
+            'FEAR_GREED_INDEX',
+            # FMP fundamentals (new, replaces Alpha Vantage)
+            'PE_RATIO', 'PEG_RATIO', 'PROFIT_MARGIN',
+            'REVENUE_GROWTH_YOY', 'EARNINGS_SURPRISE_PCT',
+            'DEBT_TO_EQUITY', 'FCF_YIELD',
+            # Finnhub sentiment
+            'NEWS_SENTIMENT',
+            # Earnings proximity (new)
+            'days_to_earnings',
+        ]
         existing_macro = [c for c in macro_cols if c in self.df.columns]
         if existing_macro:
             self.df[existing_macro] = self.df[existing_macro].ffill().bfill()

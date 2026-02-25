@@ -170,8 +170,15 @@ class OptionsAnalyzer:
             'environment': environment
         }
 
-    def analyze(self, signal: str, days_to_earnings=None) -> dict:
-        """Main analysis — returns scored call recommendations and spread setup"""
+    def analyze(self, signal: str, days_to_earnings=None, signal_score: float = 0.5) -> dict:
+        """Main analysis — returns scored call recommendations, spread setup, and Kelly sizing.
+
+        Args:
+            signal: 'BULL' or 'STRONG_BULL'
+            days_to_earnings: days until next earnings (optional)
+            signal_score: ensemble final_score from ml_result (0–1). Used to size positions
+                          via half-Kelly criterion. Default 0.5 = no edge.
+        """
 
         if signal not in ['BULL', 'STRONG_BULL']:
             return {'signal': signal, 'recommendation': 'No options plays for bearish/neutral signals'}
@@ -244,12 +251,36 @@ class OptionsAnalyzer:
 
         iv_analysis = self.assess_iv_crush_risk(days_to_earnings)
 
+        # ── Half-Kelly position sizing ────────────────────────────────────────
+        # Kelly formula for binary bets: f* = (p*(b+1) - 1) / b
+        # where p = win probability (signal_score), b = reward/risk ratio
+        # We use half-Kelly (f*/2) for safety — standard practice in trading.
+        # Capped at 5% of portfolio to prevent extreme concentration.
+        reward_risk = (spread['reward_risk'] if spread else 1.0)
+        p_win = max(0.5, min(0.95, signal_score))   # clamp: never below chance, never certain
+        b = max(0.5, reward_risk)                   # clamp: at least 0.5:1 R/R
+        kelly_full = (p_win * (b + 1) - 1) / b
+        kelly_half = max(0.0, kelly_full / 2)       # half-Kelly, floor at 0
+        suggested_risk_pct = round(min(5.0, kelly_half * 100), 1)
+
+        position_sizing = {
+            'suggested_risk_pct_of_portfolio': suggested_risk_pct,
+            'kelly_full': round(kelly_full, 3),
+            'kelly_half': round(kelly_half, 3),
+            'rationale': (
+                f"Half-Kelly: p_win={p_win:.0%}, R/R={b:.1f}:1 → "
+                f"full Kelly={kelly_full*100:.1f}%, half Kelly={kelly_half*100:.1f}% → "
+                f"capped at {suggested_risk_pct}% of portfolio"
+            ),
+        }
+
         return {
             'signal': signal,
             'top_calls': top_calls,
             'best_spread': spread,
             'iv_analysis': iv_analysis,
-            'recommendation': 'SPREAD' if iv_analysis['risk'] == 'HIGH' else 'LONG_CALL'
+            'recommendation': 'SPREAD' if iv_analysis['risk'] == 'HIGH' else 'LONG_CALL',
+            'position_sizing': position_sizing,
         }
 
 
