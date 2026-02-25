@@ -70,8 +70,9 @@ def load_combined_df(tickers: list, base_path: str = "data/processed"):
 class ModelManager:
     """Train and run XGBoost + MLP ensemble"""
 
-    def __init__(self, df: pd.DataFrame):
+    def __init__(self, df: pd.DataFrame, config: dict = None):
         self.df = df.copy()
+        self.config = config or {}
         self.xgb_model = None
         self.seq_model = None       # MLPClassifier (replaces LSTM)
         self.seq_scaler = None      # StandardScaler for MLP inputs
@@ -91,16 +92,19 @@ class ModelManager:
     def prepare_data(self):
         """Split features and targets.
 
-        Prefers target_5d_filtered (±0.5% magnitude-gated) over raw target_5d.
+        Prefers target_5d_filtered (magnitude-gated) over raw target_5d.
         The filtered target drops ~15-25% of ambiguous near-zero rows, giving the
         model cleaner signal and improving AUC by ~0.01-0.03 points.
+        
+        Threshold is configurable via prediction_threshold_pct in config (default 2.0%).
         """
         # Prefer the magnitude-filtered target; fall back to raw binary target
         if 'target_5d_filtered' in self.df.columns:
             target_col = 'target_5d_filtered'
             df_train = self.df[self.df['target_5d_filtered'].notna()].copy()
+            threshold_pct = self.config.get('prediction_threshold_pct', 2.0)
             logger.info(
-                f"Using filtered target (±0.5% threshold): "
+                f"Using filtered target (±{threshold_pct}% threshold, volatility-adjusted): "
                 f"{len(df_train)}/{len(self.df)} rows kept "
                 f"({len(self.df) - len(df_train)} ambiguous rows dropped)"
             )
@@ -111,8 +115,10 @@ class ModelManager:
             target_col = 'target_3d'
             df_train = self.df.copy()
 
+        # Exclude all target-related columns to prevent leakage
         exclude_cols = [
-            'target_5d', 'target_5d_filtered', 'target_3d', 'target_magnitude',
+            'target_5d', 'target_5d_filtered', 'target_3d', 
+            'target_magnitude', 'target_magnitude_net', 'target_threshold',
             'Open', 'High', 'Low', 'Close', 'Volume',
         ]
         # close_norm_pretrained is used inside _build_sequences, not as an XGB feature
@@ -542,7 +548,7 @@ if __name__ == "__main__":
 
     logger.info(f"Loaded {len(combined_df)} rows with {len(combined_df.columns)} features")
 
-    manager = ModelManager(combined_df)
+    manager = ModelManager(combined_df, config=config)
     manager.per_ticker_norm_stats = norm_stats  # pass per-ticker stats before training
     manager.prepare_data()
 

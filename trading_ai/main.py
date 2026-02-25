@@ -66,7 +66,7 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
         df_featured.to_parquet(f"data/processed/{ticker}_featured.parquet")
 
         # Phase 4: ML Models
-        manager = ModelManager(df_featured)
+        manager = ModelManager(df_featured, config=config)
         manager.prepare_data()
 
         # Model loading priority:
@@ -95,6 +95,15 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
         latest = df_featured.iloc[-1]
         current_price = float(latest['Close'])
         hist_vol = float(latest['hist_volatility_20'])
+        
+        # Extract days_to_earnings for options analyzer (to warn on IV crush)
+        def _safe_float(val):
+            try:
+                v = float(val)
+                return v if v != 0 else None
+            except (TypeError, ValueError):
+                return None
+        days_to_earnings = _safe_float(latest.get('days_to_earnings'))
 
         options_result = {}
         if ml_result['signal'] in ['BULL', 'STRONG_BULL']:
@@ -121,13 +130,6 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
 
         # Build fundamentals from last row — PE_RATIO / PEG_RATIO / PROFIT_MARGIN /
         # REVENUE_GROWTH_YOY / EARNINGS_SURPRISE_PCT are merged in from FMP via the data pipeline
-        def _safe_float(val):
-            try:
-                v = float(val)
-                return v if v != 0 else None
-            except (TypeError, ValueError):
-                return None
-
         fundamentals = {
             'pe_ratio':             _safe_float(latest.get('PE_RATIO')),
             'peg_ratio':            _safe_float(latest.get('PEG_RATIO')),
@@ -137,9 +139,6 @@ def analyze_ticker(ticker: str, config: dict, use_llm: bool = True) -> dict:
             'debt_to_equity':       _safe_float(latest.get('DEBT_TO_EQUITY')),
             'fcf_yield':            _safe_float(latest.get('FCF_YIELD')),
         }
-
-        # Pass days_to_earnings to options analyzer so it can warn on IV crush
-        days_to_earnings = _safe_float(latest.get('days_to_earnings'))
 
         # Prepare data package for LLM
         data_package = {
